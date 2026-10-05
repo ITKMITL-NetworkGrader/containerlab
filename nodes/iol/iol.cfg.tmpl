@@ -26,7 +26,9 @@ interface Ethernet0/0
  vrf forwarding clab-mgmt
  description clab-mgmt
  ip address {{ .MgmtIPv4Addr }} {{ .MgmtIPv4SubnetMask }}
+{{- if .MgmtIPv6Addr }}
  ipv6 address {{ .MgmtIPv6Addr }}/{{ .MgmtIPv6PrefixLen }}
+{{- end }}
  no shutdown
 !{{ range $index, $item := .DataIFaces }}
 interface Ethernet{{ .Slot }}/{{ .Port }}
@@ -41,7 +43,9 @@ interface Ethernet{{ .Slot }}/{{ .Port }}
 ip forward-protocol nd
 !
 ip route vrf clab-mgmt 0.0.0.0 0.0.0.0 Ethernet0/0 {{ .MgmtIPv4GW }}
+{{- if .MgmtIPv6GW }}
 ipv6 route vrf clab-mgmt ::/0 Ethernet0/0 {{ .MgmtIPv6GW }}
+{{- end }}
 !
 ip ssh version 2
 crypto key generate rsa modulus 2048

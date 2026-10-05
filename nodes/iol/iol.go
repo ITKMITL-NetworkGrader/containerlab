@@ -9,6 +9,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
@@ -90,6 +91,8 @@ type iol struct {
 	bootCfg           string
 	interfaces        []IOLInterface
 	firstBoot         bool
+	// bootCfgWritten is set when PreDeploy rendered the complete boot config (NTG-180).
+	bootCfgWritten bool
 }
 
 func (n *iol) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) error {
@@ -170,7 +173,9 @@ func (n *iol) PostDeploy(ctx context.Context, _ *clabnodes.PostDeployParams) err
 			"error", err)
 	}
 
-	n.GenBootConfig(ctx)
+	if err := n.postDeployBootConfig(ctx); err != nil {
+		return fmt.Errorf("failed to generate boot config: %w", err)
+	}
 
 	// Must update mgmt IP if not first boot
 	if !n.firstBoot {
@@ -196,7 +201,69 @@ func (n *iol) CreateIOLFiles(ctx context.Context) error {
 	// make folders.
 	clabutils.CreateFile(path.Join(n.Cfg.LabDir, "boot_config.txt"), "")
 
-	return n.GenInterfaceConfig(ctx)
+	if err := n.GenInterfaceConfig(ctx); err != nil {
+		return err
+	}
+
+	// NTG-180: IOL reads /iol/config.txt a few seconds after the container starts, while
+	// PostDeploy runs after the start and one node at a time, so a later node could read it empty
+	// or cut off. With a pinned mgmt address everything the config needs is known now (the mgmt
+	// network exists before nodes are created), so write it before the container starts.
+	if n.Cfg.MgmtIPv4Address == "" {
+		return nil
+	}
+	if err := n.fillMgmtNetFromRuntime(); err != nil {
+		return err
+	}
+	if err := n.GenBootConfig(ctx); err != nil {
+		return err
+	}
+	n.bootCfgWritten = true
+
+	return nil
+}
+
+// fillMgmtNetFromRuntime sets the mgmt gateway and prefix length, which are otherwise only read
+// from the running container, from the runtime's mgmt network (as cEOS does for its config).
+func (n *iol) fillMgmtNetFromRuntime() error {
+	mgmt := n.Runtime.Mgmt()
+	if n.Cfg.MgmtIPv4Gateway == "" {
+		n.Cfg.MgmtIPv4Gateway = mgmt.IPv4Gw
+	}
+	if n.Cfg.MgmtIPv4PrefixLength == 0 && mgmt.IPv4Subnet != "" {
+		_, subnet, err := net.ParseCIDR(mgmt.IPv4Subnet)
+		if err != nil {
+			return fmt.Errorf("mgmt ipv4 subnet %q: %w", mgmt.IPv4Subnet, err)
+		}
+		n.Cfg.MgmtIPv4PrefixLength, _ = subnet.Mask.Size()
+	}
+	if n.Cfg.MgmtIPv6Address != "" {
+		if n.Cfg.MgmtIPv6Gateway == "" {
+			n.Cfg.MgmtIPv6Gateway = mgmt.IPv6Gw
+		}
+		if n.Cfg.MgmtIPv6PrefixLength == 0 && mgmt.IPv6Subnet != "" {
+			_, subnet, err := net.ParseCIDR(mgmt.IPv6Subnet)
+			if err != nil {
+				return fmt.Errorf("mgmt ipv6 subnet %q: %w", mgmt.IPv6Subnet, err)
+			}
+			n.Cfg.MgmtIPv6PrefixLength, _ = subnet.Mask.Size()
+		}
+	}
+	return nil
+}
+
+// postDeployBootConfig writes the boot config only when nothing complete is there yet. Rewriting it
+// while IOL boots can be read half-written, and a restart (no PreDeploy) has no data interfaces to
+// render, so an existing config is kept as it is (NTG-180).
+func (n *iol) postDeployBootConfig(ctx context.Context) error {
+	if n.bootCfgWritten {
+		return nil
+	}
+	existing, err := os.ReadFile(path.Join(n.Cfg.LabDir, "boot_config.txt"))
+	if err == nil && strings.TrimSpace(string(existing)) != "" {
+		return nil
+	}
+	return n.GenBootConfig(ctx)
 }
 
 // Generate interfaces configuration for IOL (and iouyap/netmap).
@@ -439,14 +506,20 @@ func (n *iol) CheckInterfaceName() error {
 }
 
 func (n *iol) UpdateMgmtIntf(ctx context.Context) error {
+	// NTG-180: without a mgmt IPv6 address these lines were "ipv6 address /0" (incomplete) and a
+	// default route with no gateway.
+	ipv6Addr, ipv6Route := "", ""
+	if n.Cfg.MgmtIPv6Address != "" {
+		ipv6Addr = fmt.Sprintf("ipv6 address %s/%d\r", n.Cfg.MgmtIPv6Address, n.Cfg.MgmtIPv6PrefixLength)
+		ipv6Route = fmt.Sprintf("ipv6 route vrf clab-mgmt ::/0 Ethernet0/0 %s\r", n.Cfg.MgmtIPv6Gateway)
+	}
 	mgmt_str := fmt.Sprintf(
-		"\renable\rconfig terminal\rinterface Ethernet0/0\rip address %s %s\rno ipv6 address\ripv6 address %s/%d\rexit\rip route vrf clab-mgmt 0.0.0.0 0.0.0.0 Ethernet0/0 %s\ripv6 route vrf clab-mgmt ::/0 Ethernet0/0 %s\rend\rwr\r",
+		"\renable\rconfig terminal\rinterface Ethernet0/0\rip address %s %s\rno ipv6 address\r%sexit\rip route vrf clab-mgmt 0.0.0.0 0.0.0.0 Ethernet0/0 %s\r%send\rwr\r",
 		n.Cfg.MgmtIPv4Address,
 		clabutils.CIDRToDDN(n.Cfg.MgmtIPv4PrefixLength),
-		n.Cfg.MgmtIPv6Address,
-		n.Cfg.MgmtIPv6PrefixLength,
+		ipv6Addr,
 		n.Cfg.MgmtIPv4Gateway,
-		n.Cfg.MgmtIPv6Gateway,
+		ipv6Route,
 	)
 
 	return n.Runtime.WriteToStdinNoWait(ctx, n.Cfg.ContainerID, []byte(mgmt_str))
