@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -39,6 +40,9 @@ func (c *CLab) Save(
 	}
 
 	var wg sync.WaitGroup
+	// NTG-194: a node that failed to save must fail the save, not only the log.
+	var mu sync.Mutex
+	var failures []error
 
 	wg.Add(len(c.Nodes))
 
@@ -49,6 +53,9 @@ func (c *CLab) Save(
 			result, err := node.SaveConfig(ctx)
 			if err != nil {
 				log.Errorf("node %q save failed: %v", node.GetShortName(), err)
+				mu.Lock()
+				failures = append(failures, fmt.Errorf("node %q save failed: %w", node.GetShortName(), err))
+				mu.Unlock()
 				return
 			}
 
@@ -64,7 +71,7 @@ func (c *CLab) Save(
 
 	wg.Wait()
 
-	return nil
+	return errors.Join(failures...)
 }
 
 func (c *CLab) resolveCopyOutDst(dst string) (string, error) {

@@ -525,6 +525,25 @@ func (n *iol) UpdateMgmtIntf(ctx context.Context) error {
 	return n.Runtime.WriteToStdinNoWait(ctx, n.Cfg.ContainerID, []byte(mgmt_str))
 }
 
+// legacySSHArgs (NTG-194): IOL 15 only offers SHA-1 kex and ssh-rsa host keys, which OpenSSH 9
+// leaves out by default. scrapligo runs ssh with -F /dev/null, so the host ssh_config cannot add them.
+var legacySSHArgs = []string{
+	"-o", "KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1",
+	"-o", "HostKeyAlgorithms=+ssh-rsa",
+}
+
+// writeMemoryResult (NTG-194): IOS ends a successful "write memory" with [OK]. response.Failed
+// only recognises a few syntax errors, so anything without [OK] counts as a failed save.
+func writeMemoryResult(output string, failed error) error {
+	if failed != nil {
+		return fmt.Errorf("write memory failed: %w", failed)
+	}
+	if !strings.Contains(output, "[OK]") {
+		return fmt.Errorf("write memory did not report [OK]: %q", strings.TrimSpace(output))
+	}
+	return nil
+}
+
 // SaveConfig is used for "clab save" functionality -- it saves the running config to the startup
 // configuration.
 func (n *iol) SaveConfig(_ context.Context) (*clabnodes.SaveConfigResult, error) {
@@ -534,6 +553,7 @@ func (n *iol) SaveConfig(_ context.Context) (*clabnodes.SaveConfigResult, error)
 		options.WithAuthNoStrictKey(),
 		options.WithAuthUsername(n.Cfg.Credentials.Username),
 		options.WithAuthPassword(n.Cfg.Credentials.Password),
+		options.WithSystemTransportOpenArgs(legacySSHArgs),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create platform; error: %+v", err)
@@ -551,9 +571,12 @@ func (n *iol) SaveConfig(_ context.Context) (*clabnodes.SaveConfigResult, error)
 
 	defer d.Close()
 
-	_, err = d.SendCommand("write memory")
+	resp, err := d.SendCommand("write memory")
 	if err != nil {
 		return nil, fmt.Errorf("failed to send command; error: %+v", err)
+	}
+	if err := writeMemoryResult(resp.Result, resp.Failed); err != nil {
+		return nil, err
 	}
 
 	log.Infof(

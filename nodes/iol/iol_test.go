@@ -2,6 +2,7 @@ package cisco_iol
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path"
 	"strings"
@@ -103,5 +104,37 @@ func TestWithoutAPinnedAddressPostDeployStillWritesIt(t *testing.T) {
 	}
 	if got := bootConfig(t, n); !strings.Contains(got, "ip address 172.20.15.9") {
 		t.Errorf("unpinned node got no boot config: %q", got)
+	}
+}
+
+// NTG-194: response.Failed only knows a few syntax errors, so a write that IOS did not confirm
+// must fail the save too. Outputs measured on dev IOL 15.7 router, 15.2 switch and 17.12 router.
+func TestWriteMemoryResult(t *testing.T) {
+	for _, ok := range []string{
+		"Building configuration...\n\n  [OK]",
+		"Building configuration...\nCompressed configuration from 1280 bytes to 855 bytes[OK]",
+		"Building configuration...\n[OK]",
+	} {
+		if err := writeMemoryResult(ok, nil); err != nil {
+			t.Errorf("writeMemoryResult(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "%Error opening nvram:startup-config (No space left on device)"} {
+		if err := writeMemoryResult(bad, nil); err == nil {
+			t.Errorf("writeMemoryResult(%q) = nil, want an error", bad)
+		}
+	}
+	if err := writeMemoryResult("Building configuration...\n[OK]", errors.New("% Invalid input")); err == nil {
+		t.Error("a failed response with [OK] passed")
+	}
+}
+
+// NTG-194: IOL 15 only offers SHA-1 kex and ssh-rsa host keys, and scrapligo runs ssh with
+// -F /dev/null, so the options must come from here rather than the host ssh_config.
+func TestLegacySSHArgs(t *testing.T) {
+	got := strings.Join(legacySSHArgs, " ")
+	want := "-o KexAlgorithms=+diffie-hellman-group14-sha1,diffie-hellman-group-exchange-sha1 -o HostKeyAlgorithms=+ssh-rsa"
+	if got != want {
+		t.Errorf("legacySSHArgs = %q, want %q", got, want)
 	}
 }
