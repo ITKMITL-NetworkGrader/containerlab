@@ -595,17 +595,31 @@ func (c *CLab) postDeployApplyNodes(
 ) error {
 	execCollection := clabexec.NewExecCollection()
 
+	// NTG-207: together, as a fresh deploy does. One after another, a recreated IOL node's 10 s wait
+	// before its mgmt re-push added up per node while clab-api-server held its deploy lock.
+	if !skipPostDeploy {
+		errs := make([]error, len(nodeNames))
+		var wg sync.WaitGroup
+		for i, nodeName := range nodeNames {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := c.Nodes[nodeName].PostDeploy(
+					ctx,
+					&clabnodes.PostDeployParams{Nodes: c.Nodes},
+				); err != nil {
+					errs[i] = fmt.Errorf("node %q post-deploy: %w", nodeName, err)
+				}
+			}()
+		}
+		wg.Wait()
+		if err := errors.Join(errs...); err != nil {
+			return err
+		}
+	}
+
 	for _, nodeName := range nodeNames {
 		node := c.Nodes[nodeName]
-
-		if !skipPostDeploy {
-			if err := node.PostDeploy(
-				ctx,
-				&clabnodes.PostDeployParams{Nodes: c.Nodes},
-			); err != nil {
-				return fmt.Errorf("node %q post-deploy: %w", nodeName, err)
-			}
-		}
 
 		if err := node.RunExecFromConfig(ctx, execCollection); err != nil {
 			log.Errorf("failed to run exec commands for %s: %v", nodeName, err)

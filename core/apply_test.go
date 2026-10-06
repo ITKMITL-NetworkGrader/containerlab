@@ -988,3 +988,44 @@ func TestRuntimeContainerSortsSrosComponentsInDeploymentOrder(t *testing.T) {
 		t.Fatalf("unexpected component order %v, want %v", got, want)
 	}
 }
+
+// NTG-207: an applied IOL node's PostDeploy waits 10 s before re-pushing its mgmt address. Run one
+// node after another, a three-router lab took 30 s under clab-api-server's deploy lock.
+func TestPostDeployApplyNodesRunsNodesTogether(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	c := &CLab{Nodes: map[string]clabnodes.Node{}}
+	names := []string{"r1", "r2", "r3"}
+	for _, name := range names {
+		node := clabmocksmocknodes.NewMockNode(ctrl)
+		node.EXPECT().PostDeploy(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(context.Context, *clabnodes.PostDeployParams) error {
+				time.Sleep(300 * time.Millisecond)
+				return nil
+			})
+		node.EXPECT().RunExecFromConfig(gomock.Any(), gomock.Any()).Return(nil)
+		c.Nodes[name] = node
+	}
+
+	start := time.Now()
+	if err := c.postDeployApplyNodes(context.Background(), names, false); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed > 700*time.Millisecond {
+		t.Fatalf("post-deploy took %s; the nodes ran one after another", elapsed)
+	}
+}
+
+func TestPostDeployApplyNodesReportsANodeFailure(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	good := clabmocksmocknodes.NewMockNode(ctrl)
+	good.EXPECT().PostDeploy(gomock.Any(), gomock.Any()).Return(nil)
+	good.EXPECT().RunExecFromConfig(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	bad := clabmocksmocknodes.NewMockNode(ctrl)
+	bad.EXPECT().PostDeploy(gomock.Any(), gomock.Any()).Return(os.ErrDeadlineExceeded)
+	c := &CLab{Nodes: map[string]clabnodes.Node{"good": good, "bad": bad}}
+
+	err := c.postDeployApplyNodes(context.Background(), []string{"good", "bad"}, false)
+	if err == nil || !strings.Contains(err.Error(), `node "bad" post-deploy`) {
+		t.Fatalf("got %v, want the failing node named", err)
+	}
+}
