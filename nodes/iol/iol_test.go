@@ -138,3 +138,34 @@ func TestLegacySSHArgs(t *testing.T) {
 		t.Errorf("legacySSHArgs = %q, want %q", got, want)
 	}
 }
+
+// NTG-207: a node recreated moments after its first create (a link added by the next apply) still
+// has the empty NVRAM file clab made, so it is a first boot: no 10 s wait and no mgmt re-push.
+func TestAnEmptyNvramIsAFirstBoot(t *testing.T) {
+	n := newTestIOL(t, "172.20.15.2")
+	if err := os.WriteFile(path.Join(n.Cfg.LabDir, n.nvramFile), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.CreateIOLFiles(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !n.firstBoot {
+		t.Error("an empty NVRAM was taken as a saved config")
+	}
+}
+
+func TestAWrittenNvramIsNotAFirstBoot(t *testing.T) {
+	n := newTestIOL(t, "172.20.15.2")
+	if err := os.WriteFile(path.Join(n.Cfg.LabDir, n.nvramFile), make([]byte, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.CreateIOLFiles(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n.firstBoot {
+		t.Error("a node with NVRAM content was taken as a first boot")
+	}
+	if info, _ := os.Stat(path.Join(n.Cfg.LabDir, n.nvramFile)); info.Size() != 1024 {
+		t.Errorf("NVRAM was rewritten: %d bytes", info.Size())
+	}
+}

@@ -191,9 +191,15 @@ func (n *iol) PostDeploy(ctx context.Context, _ *clabnodes.PostDeployParams) err
 func (n *iol) CreateIOLFiles(ctx context.Context) error {
 	// If NVRAM already exists, don't need to create
 	// otherwise saved configs in NVRAM are overwritten.
-	if !clabutils.FileExists(path.Join(n.Cfg.LabDir, n.nvramFile)) {
+	nvram := path.Join(n.Cfg.LabDir, n.nvramFile)
+	if !clabutils.FileExists(nvram) {
 		// create nvram file
-		clabutils.CreateFile(path.Join(n.Cfg.LabDir, n.nvramFile), "")
+		clabutils.CreateFile(nvram, "")
+		n.firstBoot = true
+	} else if info, err := os.Stat(nvram); err == nil && info.Size() == 0 {
+		// NTG-207: still the empty file clab made, so IOL never ran on it (a node recreated right
+		// after its first create, when the next apply adds its links). Booting from the boot config
+		// is a first boot; the 10 s wait and mgmt re-push in PostDeploy ran per node, one at a time.
 		n.firstBoot = true
 	}
 
