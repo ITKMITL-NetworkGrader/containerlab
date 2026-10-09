@@ -25,6 +25,7 @@ func newTestIOL(t *testing.T, mgmtIP string) *iol {
 	n.DefaultNode = *clabnodes.NewDefaultNode(n)
 	n.Cfg = &clabtypes.NodeConfig{ShortName: "router1", LabDir: t.TempDir(), MgmtIPv4Address: mgmtIP}
 	n.nvramFile = "nvram_00001"
+	n.hostNvram = path.Join(n.Cfg.LabDir, "nvram")
 	n.WithRuntime(rt)
 	return n
 }
@@ -143,7 +144,7 @@ func TestLegacySSHArgs(t *testing.T) {
 // has the empty NVRAM file clab made, so it is a first boot: no 10 s wait and no mgmt re-push.
 func TestAnEmptyNvramIsAFirstBoot(t *testing.T) {
 	n := newTestIOL(t, "172.20.15.2")
-	if err := os.WriteFile(path.Join(n.Cfg.LabDir, n.nvramFile), nil, 0o644); err != nil {
+	if err := os.WriteFile(n.hostNvram, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.CreateIOLFiles(context.Background()); err != nil {
@@ -156,7 +157,7 @@ func TestAnEmptyNvramIsAFirstBoot(t *testing.T) {
 
 func TestAWrittenNvramIsNotAFirstBoot(t *testing.T) {
 	n := newTestIOL(t, "172.20.15.2")
-	if err := os.WriteFile(path.Join(n.Cfg.LabDir, n.nvramFile), make([]byte, 1024), 0o644); err != nil {
+	if err := os.WriteFile(n.hostNvram, make([]byte, 1024), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := n.CreateIOLFiles(context.Background()); err != nil {
@@ -165,7 +166,7 @@ func TestAWrittenNvramIsNotAFirstBoot(t *testing.T) {
 	if n.firstBoot {
 		t.Error("a node with NVRAM content was taken as a first boot")
 	}
-	if info, _ := os.Stat(path.Join(n.Cfg.LabDir, n.nvramFile)); info.Size() != 1024 {
+	if info, _ := os.Stat(n.hostNvram); info.Size() != 1024 {
 		t.Errorf("NVRAM was rewritten: %d bytes", info.Size())
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path"
@@ -16,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/template"
 	"time"
 
@@ -87,6 +89,7 @@ type iol struct {
 	isL2Node          bool
 	Pid               string
 	nvramFile         string
+	hostNvram         string
 	partialStartupCfg string
 	bootCfg           string
 	interfaces        []IOLInterface
@@ -107,13 +110,14 @@ func (n *iol) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) erro
 
 	nodeType := strings.ToLower(n.Cfg.NodeType)
 
-	n.Pid = strconv.Itoa(n.Cfg.Index + 1) // n.Cfg.Index is zero-indexed, PID needs to be >= 1
-
-	env := map[string]string{
-		"IOL_PID": n.Pid,
+	pid, err := iolPid(n.Cfg.MgmtIPv4Address, n.Cfg.Index)
+	if err != nil {
+		return fmt.Errorf("node %s: %w", n.Cfg.ShortName, err)
 	}
+	n.Pid = strconv.Itoa(pid)
 
-	n.Cfg.Env = clabutils.MergeStringMaps(env, n.Cfg.Env)
+	// After the merge: IOL_PID must match the NVRAM file name and NETMAP.
+	n.Cfg.Env = clabutils.MergeStringMaps(n.Cfg.Env, map[string]string{"IOL_PID": n.Pid})
 
 	// check if user submitted node type is valid
 	switch nodeType {
@@ -127,10 +131,12 @@ func (n *iol) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) erro
 	}
 
 	n.nvramFile = fmt.Sprint("nvram_", fmt.Sprintf("%05s", n.Pid))
+	// NTG-231: one host file per node, whatever the PID, so the saved config follows the node.
+	n.hostNvram = path.Join(n.Cfg.LabDir, "nvram")
 
 	n.Cfg.Binds = append(n.Cfg.Binds,
 		// mount nvram so that config persists
-		fmt.Sprint(path.Join(n.Cfg.LabDir, n.nvramFile), ":", path.Join(iol_workdir, n.nvramFile)),
+		fmt.Sprint(n.hostNvram, ":", path.Join(iol_workdir, n.nvramFile)),
 
 		// mount launch config
 		fmt.Sprint(filepath.Join(n.Cfg.LabDir, "boot_config.txt"), ":/iol/config.txt"),
@@ -189,19 +195,18 @@ func (n *iol) PostDeploy(ctx context.Context, _ *clabnodes.PostDeployParams) err
 }
 
 func (n *iol) CreateIOLFiles(ctx context.Context) error {
+	if err := n.adoptLegacyNvram(); err != nil {
+		return err
+	}
 	// If NVRAM already exists, don't need to create
 	// otherwise saved configs in NVRAM are overwritten.
-	nvram := path.Join(n.Cfg.LabDir, n.nvramFile)
-	if !clabutils.FileExists(nvram) {
-		// create nvram file
-		clabutils.CreateFile(nvram, "")
-		n.firstBoot = true
-	} else if info, err := os.Stat(nvram); err == nil && info.Size() == 0 {
-		// NTG-207: still the empty file clab made, so IOL never ran on it (a node recreated right
-		// after its first create, when the next apply adds its links). Booting from the boot config
-		// is a first boot; the 10 s wait and mgmt re-push in PostDeploy ran per node, one at a time.
-		n.firstBoot = true
+	if !clabutils.FileExists(n.hostNvram) {
+		clabutils.CreateFile(n.hostNvram, "")
 	}
+	// NTG-207: still clab's placeholder (one byte, "\n"), so IOL never ran on it (a node recreated
+	// right after its first create, when the next apply adds its links). Booting from the boot
+	// config is a first boot; the 10 s wait and mgmt re-push in PostDeploy ran per node.
+	n.firstBoot = !nvramWritten(n.hostNvram)
 
 	// create these files so the bind monut doesn't automatically
 	// make folders.
@@ -590,4 +595,116 @@ func (n *iol) SaveConfig(_ context.Context) (*clabnodes.SaveConfigResult, error)
 		n.Cfg.ShortName,
 	)
 	return nil, nil
+}
+
+// NTG-231: a node's PID was Index+1, its place among all node names sorted, so adding a node with
+// an earlier name changed it. The pinned mgmt address does not change for the node's lifetime and
+// is unique in the lab; 513+host keeps clear of the old PIDs (1..nodes) still running and of
+// iouyap's 513.
+func iolPid(mgmtIPv4 string, index int) (int, error) {
+	if ip := net.ParseIP(mgmtIPv4).To4(); ip != nil && ip[3] >= 1 && ip[3] <= 254 {
+		return 513 + int(ip[3]), nil
+	}
+	pid := index + 1
+	if pid == 513 || pid > 1023 {
+		return 0, fmt.Errorf("IOL PID %d is out of range (1-1023, not 513); pin a mgmt-ipv4", pid)
+	}
+	return pid, nil
+}
+
+var legacyNvramName = regexp.MustCompile(`^nvram_\d{5}$`)
+
+// nvramWritten reports whether IOL has written the file: clab's placeholder is one byte.
+func nvramWritten(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.Mode().IsRegular() && info.Size() > 1
+}
+
+// adoptLegacyNvram copies, once, the config a lab deployed before NTG-231 kept in nvram_<PID>
+// into nvram. The file the old binary opened (nvram_<Index+1>) comes first; failing that, the
+// newest written one. The original stays, for a rollback.
+func (n *iol) adoptLegacyNvram() error {
+	if nvramWritten(n.hostNvram) {
+		return nil
+	}
+	entries, err := os.ReadDir(n.Cfg.LabDir)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	src := path.Join(n.Cfg.LabDir, fmt.Sprintf("nvram_%05d", n.Cfg.Index+1))
+	if !nvramWritten(src) {
+		src = ""
+		var newest time.Time
+		var candidates []string
+		for _, e := range entries {
+			p := path.Join(n.Cfg.LabDir, e.Name())
+			if !legacyNvramName.MatchString(e.Name()) || e.Name() == "nvram_00000" || !nvramWritten(p) {
+				continue
+			}
+			info, err := os.Stat(p)
+			if err != nil {
+				return err
+			}
+			candidates = append(candidates, e.Name())
+			// ReadDir is sorted, so on equal mtimes the later (larger) name wins
+			if !info.ModTime().Before(newest) {
+				newest, src = info.ModTime(), p
+			}
+		}
+		if len(candidates) > 1 {
+			log.Warn("IOL node has several saved NVRAM files; using the newest",
+				"node", n.Cfg.ShortName, "files", candidates, "using", path.Base(src))
+		}
+	}
+	if src == "" {
+		return nil
+	}
+	log.Info("IOL NVRAM moved to the per-node file (NTG-231)", "node", n.Cfg.ShortName, "from", path.Base(src))
+	return copyFileAtomic(src, n.hostNvram)
+}
+
+// copyFileAtomic copies src to dst through a temp file in dst's directory, with src's owner and
+// mode, so dst is either absent or complete.
+func copyFileAtomic(src, dst string) (err error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	tmp := path.Join(path.Dir(dst), fmt.Sprintf(".nvram.tmp-%d", os.Getpid()))
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			out.Close()
+			os.Remove(tmp)
+		}
+	}()
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		if err = out.Chown(int(st.Uid), int(st.Gid)); err != nil {
+			return err
+		}
+	}
+	if err = out.Chmod(info.Mode().Perm()); err != nil {
+		return err
+	}
+	if err = out.Sync(); err != nil {
+		return err
+	}
+	if err = out.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
