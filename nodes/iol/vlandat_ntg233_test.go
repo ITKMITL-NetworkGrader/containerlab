@@ -7,7 +7,6 @@ package cisco_iol
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"math/rand"
 	"os"
 	"path"
@@ -39,35 +38,41 @@ func TestEveryIOLNodeBindsVlanDatAtItsPid(t *testing.T) {
 		index  int
 		env    map[string]string
 		pid    string
+		target string
 	}{
-		{"l3 pinned", initIOL, "172.20.15.2", 4, nil, "515"},
-		{"l2 pinned", initL2, "172.20.15.2", 4, nil, "515"},
-		{"l2 index fallback", initL2, "", 2, nil, "3"},
-		{"l2 env override", initL2, "172.20.15.2", 0, map[string]string{"IOL_PID": "9"}, "515"},
+		{"l3 pinned", initIOL, "172.20.15.2", 4, nil, "515", "/iol/vlan.dat-00515"},
+		{"l2 pinned", initL2, "172.20.15.2", 4, nil, "515", "/iol/vlan.dat-00515"},
+		{"l2 index fallback", initL2, "", 2, nil, "3", "/iol/vlan.dat-00003"},
+		{"l2 env override", initL2, "172.20.15.2", 0, map[string]string{"IOL_PID": "9"}, "515", "/iol/vlan.dat-00515"},
 	}
 	for _, c := range cases {
-		dir := t.TempDir()
-		n, err := c.init(t, dir, c.mgmtIP, c.index, c.env)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if n.Cfg.Env["IOL_PID"] != c.pid {
-			t.Fatalf("%s: IOL_PID %s, want %s", c.name, n.Cfg.Env["IOL_PID"], c.pid)
-		}
-		want := fmt.Sprintf("%s:/iol/vlan.dat-%05s", path.Join(dir, "vlan.dat"), n.Cfg.Env["IOL_PID"])
-		found := false
-		for _, b := range n.Cfg.Binds {
-			found = found || b == want
-		}
-		if !found {
-			t.Errorf("%s: binds %v lack %q", c.name, n.Cfg.Binds, want)
-		}
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			n, err := c.init(t, dir, c.mgmtIP, c.index, c.env)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n.Cfg.Env["IOL_PID"] != c.pid {
+				t.Fatalf("IOL_PID %s, want %s", n.Cfg.Env["IOL_PID"], c.pid)
+			}
+			want := path.Join(dir, "vlan.dat") + ":" + c.target
+			found := false
+			for _, b := range n.Cfg.Binds {
+				found = found || b == want
+			}
+			if !found {
+				t.Errorf("binds %v lack %q", n.Cfg.Binds, want)
+			}
+		})
 	}
 }
 
 func TestCreateIOLFilesMakesTheVlanDatPlaceholderOnce(t *testing.T) {
 	dir := t.TempDir()
-	n, _ := initL2(t, dir, "172.20.15.2", 0, nil)
+	n, err := initL2(t, dir, "172.20.15.2", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := n.CreateIOLFiles(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +90,9 @@ func TestCreateIOLFilesMakesTheVlanDatPlaceholderOnce(t *testing.T) {
 	if err := os.WriteFile(path.Join(dir, "vlan.dat"), saved, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	n, _ = initL2(t, dir, "172.20.15.2", 0, nil)
+	if n, err = initL2(t, dir, "172.20.15.2", 0, nil); err != nil {
+		t.Fatal(err)
+	}
 	if err := n.CreateIOLFiles(context.Background()); err != nil {
 		t.Fatal(err)
 	}
