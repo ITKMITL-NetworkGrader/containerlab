@@ -119,12 +119,14 @@ func TestNetmapUsesThePid(t *testing.T) {
 }
 
 // A lab deployed before the fix keeps its config in nvram_<old PID>. The first deploy after the
-// fix copies the file the old binary opened, nvram_<Index+1>, into nvram and leaves it in place.
-func TestFirstDeployAfterTheFixCopiesTheFileTheOldBinaryOpened(t *testing.T) {
+// fix copies the newest written one, which is the file the running IOL had mounted (IOL writes
+// its NVRAM at boot and on every save). Index+1 only breaks a tie: the apply that recreates the
+// node has usually changed its Index already.
+func TestFirstDeployAfterTheFixCopiesTheNewestWrittenNvram(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
-	writeFile(t, path.Join(dir, "nvram_00002"), 1<<20, now.Add(-time.Hour))
-	writeFile(t, path.Join(dir, "nvram_00003"), 2048, now) // newer, but not the old binary's file
+	writeFile(t, path.Join(dir, "nvram_00002"), 1<<20, now.Add(-time.Hour)) // Index+1 now, but stale
+	writeFile(t, path.Join(dir, "nvram_00001"), 2048, now)                  // what the node ran on
 	n, err := initIOL(t, dir, "172.20.15.2", 1, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -132,10 +134,10 @@ func TestFirstDeployAfterTheFixCopiesTheFileTheOldBinaryOpened(t *testing.T) {
 	if err := n.CreateIOLFiles(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if got := readSize(t, path.Join(dir, "nvram")); got != 1<<20 {
-		t.Errorf("nvram has %d bytes, want the 1 MiB nvram_00002", got)
+	if got := readSize(t, path.Join(dir, "nvram")); got != 2048 {
+		t.Errorf("nvram has %d bytes, want the newest, nvram_00001", got)
 	}
-	if readSize(t, path.Join(dir, "nvram_00002")) != 1<<20 {
+	if readSize(t, path.Join(dir, "nvram_00001")) != 2048 {
 		t.Error("the original was changed")
 	}
 	if n.firstBoot {
@@ -143,10 +145,24 @@ func TestFirstDeployAfterTheFixCopiesTheFileTheOldBinaryOpened(t *testing.T) {
 	}
 }
 
-func TestWithoutTheOldBinarysFileTheNewestWrittenOneIsCopied(t *testing.T) {
+func TestOnEqualMtimesIndexPlusOneWins(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
-	writeFile(t, path.Join(dir, "nvram_00002"), 1, now) // Index+1, but only clab's placeholder
+	writeFile(t, path.Join(dir, "nvram_00002"), 1000, now) // Index+1
+	writeFile(t, path.Join(dir, "nvram_00004"), 3000, now)
+	n, _ := initIOL(t, dir, "172.20.15.2", 1, nil)
+	if err := n.CreateIOLFiles(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := readSize(t, path.Join(dir, "nvram")); got != 1000 {
+		t.Errorf("nvram has %d bytes, want nvram_00002's 1000", got)
+	}
+}
+
+func TestAPlaceholderIsNeverASource(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	writeFile(t, path.Join(dir, "nvram_00002"), 1, now) // Index+1 and newest, but clab's placeholder
 	writeFile(t, path.Join(dir, "nvram_00001"), 1000, now.Add(-time.Hour))
 	writeFile(t, path.Join(dir, "nvram_00004"), 3000, now.Add(-time.Minute))
 	n, _ := initIOL(t, dir, "172.20.15.2", 1, nil)
@@ -157,7 +173,7 @@ func TestWithoutTheOldBinarysFileTheNewestWrittenOneIsCopied(t *testing.T) {
 		t.Errorf("nvram has %d bytes, want nvram_00004's 3000", got)
 	}
 
-	// equal mtimes: the larger name wins, so the choice does not depend on directory order
+	// equal mtimes without Index+1 among them: the larger name wins, whatever the directory order
 	dir = t.TempDir()
 	writeFile(t, path.Join(dir, "nvram_00001"), 1000, now)
 	writeFile(t, path.Join(dir, "nvram_00004"), 3000, now)
@@ -266,5 +282,27 @@ func TestAnUnreadableSourceStopsTheDeploy(t *testing.T) {
 	n, _ := initIOL(t, dir, "172.20.15.2", 1, nil)
 	if err := n.CreateIOLFiles(context.Background()); err == nil {
 		t.Error("no error; the node would boot without its saved config")
+	}
+}
+
+func TestAFailedCopyLeavesNoTempFile(t *testing.T) {
+	dir := t.TempDir()
+	src := path.Join(dir, "nvram_00002")
+	writeFile(t, src, 4096, time.Now())
+	dst := path.Join(dir, "target")
+	if err := os.Mkdir(dst, 0o755); err != nil { // rename onto a non-empty directory fails
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path.Join(dst, "x"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFileAtomic(src, dst); err == nil {
+		t.Fatal("no error")
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".nvram.tmp") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
 	}
 }

@@ -201,7 +201,9 @@ func (n *iol) CreateIOLFiles(ctx context.Context) error {
 	// If NVRAM already exists, don't need to create
 	// otherwise saved configs in NVRAM are overwritten.
 	if !clabutils.FileExists(n.hostNvram) {
-		clabutils.CreateFile(n.hostNvram, "")
+		if err := clabutils.CreateFile(n.hostNvram, ""); err != nil {
+			return err
+		}
 	}
 	// NTG-207: still clab's placeholder (one byte, "\n"), so IOL never ran on it (a node recreated
 	// right after its first create, when the next apply adds its links). Booting from the boot
@@ -599,7 +601,7 @@ func (n *iol) SaveConfig(_ context.Context) (*clabnodes.SaveConfigResult, error)
 
 // NTG-231: a node's PID was Index+1, its place among all node names sorted, so adding a node with
 // an earlier name changed it. The pinned mgmt address does not change for the node's lifetime and
-// is unique in the lab; 513+host keeps clear of the old PIDs (1..nodes) still running and of
+// is unique in the lab (the last octet is, on the /24 mgmt subnets NetGrader uses); 513+host keeps clear of the old PIDs (1..nodes) still running and of
 // iouyap's 513.
 func iolPid(mgmtIPv4 string, index int) (int, error) {
 	if ip := net.ParseIP(mgmtIPv4).To4(); ip != nil && ip[3] >= 1 && ip[3] <= 254 {
@@ -621,8 +623,9 @@ func nvramWritten(p string) bool {
 }
 
 // adoptLegacyNvram copies, once, the config a lab deployed before NTG-231 kept in nvram_<PID>
-// into nvram. The file the old binary opened (nvram_<Index+1>) comes first; failing that, the
-// newest written one. The original stays, for a rollback.
+// into nvram: the newest written file, which is the one the running IOL had mounted (IOL writes
+// its NVRAM at boot and on every save). Index+1 only breaks a tie, because the apply that
+// recreates the node has usually changed its Index already. The original stays, for a rollback.
 func (n *iol) adoptLegacyNvram() error {
 	if nvramWritten(n.hostNvram) {
 		return nil
@@ -634,33 +637,33 @@ func (n *iol) adoptLegacyNvram() error {
 	if err != nil {
 		return err
 	}
-	src := path.Join(n.Cfg.LabDir, fmt.Sprintf("nvram_%05d", n.Cfg.Index+1))
-	if !nvramWritten(src) {
-		src = ""
-		var newest time.Time
-		var candidates []string
-		for _, e := range entries {
-			p := path.Join(n.Cfg.LabDir, e.Name())
-			if !legacyNvramName.MatchString(e.Name()) || e.Name() == "nvram_00000" || !nvramWritten(p) {
-				continue
-			}
-			info, err := os.Stat(p)
-			if err != nil {
-				return err
-			}
-			candidates = append(candidates, e.Name())
-			// ReadDir is sorted, so on equal mtimes the later (larger) name wins
-			if !info.ModTime().Before(newest) {
-				newest, src = info.ModTime(), p
-			}
+	indexFile := fmt.Sprintf("nvram_%05d", n.Cfg.Index+1)
+	src := ""
+	var newest time.Time
+	var candidates []string
+	for _, e := range entries { // sorted by name
+		p := path.Join(n.Cfg.LabDir, e.Name())
+		if !legacyNvramName.MatchString(e.Name()) || e.Name() == "nvram_00000" || !nvramWritten(p) {
+			continue
 		}
-		if len(candidates) > 1 {
-			log.Warn("IOL node has several saved NVRAM files; using the newest",
-				"node", n.Cfg.ShortName, "files", candidates, "using", path.Base(src))
+		info, err := os.Stat(p)
+		if err != nil {
+			return err
+		}
+		candidates = append(candidates, e.Name())
+		switch mtime := info.ModTime(); {
+		case src == "" || mtime.After(newest):
+			newest, src = mtime, p
+		case mtime.Equal(newest) && path.Base(src) != indexFile:
+			src = p // a later (larger) name, unless Index+1 already holds the tie
 		}
 	}
 	if src == "" {
 		return nil
+	}
+	if len(candidates) > 1 {
+		log.Warn("IOL node has several saved NVRAM files; using the newest",
+			"node", n.Cfg.ShortName, "files", candidates, "using", path.Base(src))
 	}
 	log.Info("IOL NVRAM moved to the per-node file (NTG-231)", "node", n.Cfg.ShortName, "from", path.Base(src))
 	return copyFileAtomic(src, n.hostNvram)
@@ -678,11 +681,11 @@ func copyFileAtomic(src, dst string) (err error) {
 	if err != nil {
 		return err
 	}
-	tmp := path.Join(path.Dir(dst), fmt.Sprintf(".nvram.tmp-%d", os.Getpid()))
-	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	out, err := os.CreateTemp(path.Dir(dst), ".nvram.tmp-*")
 	if err != nil {
 		return err
 	}
+	tmp := out.Name()
 	defer func() {
 		if err != nil {
 			out.Close()
