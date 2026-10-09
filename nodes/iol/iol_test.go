@@ -26,6 +26,7 @@ func newTestIOL(t *testing.T, mgmtIP string) *iol {
 	n.Cfg = &clabtypes.NodeConfig{ShortName: "router1", LabDir: t.TempDir(), MgmtIPv4Address: mgmtIP}
 	n.nvramFile = "nvram_00001"
 	n.hostNvram = path.Join(n.Cfg.LabDir, "nvram")
+	n.hostVlanDat = path.Join(n.Cfg.LabDir, "vlan.dat")
 	n.WithRuntime(rt)
 	return n
 }

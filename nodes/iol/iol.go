@@ -90,6 +90,7 @@ type iol struct {
 	Pid               string
 	nvramFile         string
 	hostNvram         string
+	hostVlanDat       string
 	partialStartupCfg string
 	bootCfg           string
 	interfaces        []IOLInterface
@@ -133,10 +134,13 @@ func (n *iol) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) erro
 	n.nvramFile = fmt.Sprint("nvram_", fmt.Sprintf("%05s", n.Pid))
 	// NTG-231: one host file per node, whatever the PID, so the saved config follows the node.
 	n.hostNvram = path.Join(n.Cfg.LabDir, "nvram")
+	// NTG-233: VLANs and the VTP state live in vlan.dat-<PID>, not in NVRAM. L3 never writes it.
+	n.hostVlanDat = path.Join(n.Cfg.LabDir, "vlan.dat")
 
 	n.Cfg.Binds = append(n.Cfg.Binds,
 		// mount nvram so that config persists
 		fmt.Sprint(n.hostNvram, ":", path.Join(iol_workdir, n.nvramFile)),
+		fmt.Sprint(n.hostVlanDat, ":", path.Join(iol_workdir, fmt.Sprintf("vlan.dat-%05s", n.Pid))),
 
 		// mount launch config
 		fmt.Sprint(filepath.Join(n.Cfg.LabDir, "boot_config.txt"), ":/iol/config.txt"),
@@ -209,6 +213,11 @@ func (n *iol) CreateIOLFiles(ctx context.Context) error {
 	// right after its first create, when the next apply adds its links). Booting from the boot
 	// config is a first boot; the 10 s wait and mgmt re-push in PostDeploy ran per node.
 	n.firstBoot = !nvramWritten(n.hostNvram)
+	if !clabutils.FileExists(n.hostVlanDat) {
+		if err := clabutils.CreateFile(n.hostVlanDat, ""); err != nil {
+			return err
+		}
+	}
 
 	// create these files so the bind monut doesn't automatically
 	// make folders.
