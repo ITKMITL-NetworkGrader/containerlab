@@ -213,8 +213,9 @@ func (n *iol) CreateIOLFiles(ctx context.Context) error {
 	// right after its first create, when the next apply adds its links). Booting from the boot
 	// config is a first boot; the 10 s wait and mgmt re-push in PostDeploy ran per node.
 	n.firstBoot = !nvramWritten(n.hostNvram)
+	// Empty, not CreateFile's "\n": IOS logs %SW_VLAN-4-IFS_FAILURE at boot on a one-byte file.
 	if !clabutils.FileExists(n.hostVlanDat) {
-		if err := clabutils.CreateFile(n.hostVlanDat, ""); err != nil {
+		if err := os.WriteFile(n.hostVlanDat, nil, 0o666); err != nil {
 			return err
 		}
 	}

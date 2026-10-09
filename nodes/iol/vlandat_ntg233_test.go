@@ -71,8 +71,13 @@ func TestCreateIOLFilesMakesTheVlanDatPlaceholderOnce(t *testing.T) {
 	if err := n.CreateIOLFiles(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if info, err := os.Stat(path.Join(dir, "vlan.dat")); err != nil || !info.Mode().IsRegular() {
-		t.Fatalf("no regular vlan.dat placeholder: %v", err)
+	// Empty, not clab's one-byte "\n": IOS logs %SW_VLAN-4-IFS_FAILURE at boot on a one-byte file.
+	info, err := os.Stat(path.Join(dir, "vlan.dat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Size() != 0 {
+		t.Fatalf("want an empty regular vlan.dat placeholder, got mode %v, %d bytes", info.Mode(), info.Size())
 	}
 
 	saved := make([]byte, 676)
