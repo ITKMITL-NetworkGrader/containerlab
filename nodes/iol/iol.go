@@ -25,6 +25,7 @@ import (
 	"github.com/scrapli/scrapligo/driver/options"
 	"github.com/scrapli/scrapligo/platform"
 	clabconstants "github.com/srl-labs/containerlab/constants"
+	clabexec "github.com/srl-labs/containerlab/exec"
 	clablinks "github.com/srl-labs/containerlab/links"
 	clabnodes "github.com/srl-labs/containerlab/nodes"
 	clabtypes "github.com/srl-labs/containerlab/types"
@@ -187,15 +188,19 @@ func (n *iol) PostDeploy(ctx context.Context, _ *clabnodes.PostDeployParams) err
 		return fmt.Errorf("failed to generate boot config: %w", err)
 	}
 
-	// Must update mgmt IP if not first boot
-	if !n.firstBoot {
-		// iol has a 5sec boot delay, wait a few extra secs for the console
-		time.Sleep(10 * time.Second)
+	return n.updateMgmtAfterBoot(ctx)
+}
 
-		return n.UpdateMgmtIntf(ctx)
+// updateMgmtAfterBoot types the mgmt address into a rebooted node (its NVRAM config may hold an old one).
+// A console node has no mgmt address in its config, and typing into its stdin would bypass the grader's
+// console lock and `wr` the student's running config (NTG-253 S6).
+func (n *iol) updateMgmtAfterBoot(ctx context.Context) error {
+	if n.firstBoot || n.consoleMode() {
+		return nil
 	}
-
-	return nil
+	// iol has a 5sec boot delay, wait a few extra secs for the console
+	time.Sleep(10 * time.Second)
+	return n.UpdateMgmtIntf(ctx)
 }
 
 func (n *iol) CreateIOLFiles(ctx context.Context) error {
@@ -292,8 +297,14 @@ func (n *iol) postDeployBootConfig(ctx context.Context) error {
 // Generate interfaces configuration for IOL (and iouyap/netmap).
 func (n *iol) GenInterfaceConfig(_ context.Context) error {
 	// add default 'boilerplate' to NETMAP and iouyap.ini for management port (e0/0)
-	iouyapData := "[default]\nbase_port = 49000\nnetmap = /iol/NETMAP\n[513:0/0]\neth_dev = eth0\n"
-	netmapdata := fmt.Sprintf("%s:0/0 513:0/0\n", n.Pid)
+	iouyapData := "[default]\nbase_port = 49000\nnetmap = /iol/NETMAP\n"
+	netmapdata := ""
+	// A console node's Ethernet0/0 stays unplugged, like an unused port in GNS3: wired to the docker
+	// mgmt bridge it would join every node of the lab behind the student's topology.
+	if !n.consoleMode() {
+		iouyapData += "[513:0/0]\neth_dev = eth0\n"
+		netmapdata = fmt.Sprintf("%s:0/0 513:0/0\n", n.Pid)
+	}
 
 	slot, port := 0, 0
 
@@ -548,6 +559,14 @@ func (n *iol) UpdateMgmtIntf(ctx context.Context) error {
 	return n.Runtime.WriteToStdinNoWait(ctx, n.Cfg.ContainerID, []byte(mgmt_str))
 }
 
+// NTG-254: a node with this env set is reached only over its con0 console (the image's relay);
+// it boots a blank config with no mgmt address, so nothing may type into it or SSH to it.
+const envConsole = "CLAB_IOL_CONSOLE"
+
+var consoleSaveCmd = []string{"/console-cmd", "write memory"}
+
+func (n *iol) consoleMode() bool { return n.Cfg.Env[envConsole] == "1" }
+
 // legacySSHArgs (NTG-194): IOL 15 only offers SHA-1 kex and ssh-rsa host keys, which OpenSSH 9
 // leaves out by default. scrapligo runs ssh with -F /dev/null, so the host ssh_config cannot add them.
 var legacySSHArgs = []string{
@@ -567,9 +586,27 @@ func writeMemoryResult(output string, failed error) error {
 	return nil
 }
 
+func (n *iol) saveOverConsole(ctx context.Context) error {
+	res, err := n.RunExec(ctx, clabexec.NewExecCmdFromSlice(consoleSaveCmd))
+	if err != nil {
+		return fmt.Errorf("console save failed: %w", err)
+	}
+	if res.GetReturnCode() != 0 {
+		return fmt.Errorf("console save failed: %s", strings.TrimSpace(res.GetStdErrString()))
+	}
+	if err := writeMemoryResult(res.GetStdOutString(), nil); err != nil {
+		return err
+	}
+	log.Infof("Saved running configuration over the console for node: %q", n.Cfg.ShortName)
+	return nil
+}
+
 // SaveConfig is used for "clab save" functionality -- it saves the running config to the startup
 // configuration.
-func (n *iol) SaveConfig(_ context.Context) (*clabnodes.SaveConfigResult, error) {
+func (n *iol) SaveConfig(ctx context.Context) (*clabnodes.SaveConfigResult, error) {
+	if n.consoleMode() {
+		return nil, n.saveOverConsole(ctx)
+	}
 	p, err := platform.NewPlatform(
 		"cisco_iosxe",
 		n.Cfg.LongName,
