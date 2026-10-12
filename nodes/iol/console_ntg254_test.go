@@ -68,7 +68,7 @@ func TestConsoleNodeSavesThroughConsoleCmd(t *testing.T) {
 	}
 }
 
-func TestConsoleNodeSaveFailsWithoutOK(t *testing.T) {
+func TestConsoleNodeSaveFailsOnConsoleError(t *testing.T) {
 	n, rt := consoleIOL(t)
 	res := clabexec.NewExecResult(clabexec.NewExecCmdFromSlice(consoleSaveCmd))
 	res.SetReturnCode(3)
@@ -77,6 +77,16 @@ func TestConsoleNodeSaveFailsWithoutOK(t *testing.T) {
 	_, err := n.SaveConfig(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "CONSOLE_LOCKED") {
 		t.Fatalf("want CONSOLE_LOCKED error, got %v", err)
+	}
+}
+
+func TestConsoleNodeSaveFailsWithoutOK(t *testing.T) {
+	n, rt := consoleIOL(t)
+	res := clabexec.NewExecResult(clabexec.NewExecCmdFromSlice(consoleSaveCmd))
+	res.SetStdOut([]byte("Building configuration...\n"))
+	rt.EXPECT().Exec(gomock.Any(), "clab-lab-router1", gomock.Any()).Return(res, nil)
+	if _, err := n.SaveConfig(context.Background()); err == nil {
+		t.Fatal("a write memory without [OK] must fail the save")
 	}
 }
 
