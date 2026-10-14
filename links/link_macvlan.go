@@ -166,11 +166,22 @@ func (l *LinkMacVlan) Deploy(ctx context.Context, _ Endpoint) error {
 		Mode: l.Mode.ToNetlinkMode(),
 	}
 	// add the link in the Host NetNS
-	err = netlink.LinkAdd(link)
-	if err != nil {
+	if err := netlink.LinkAdd(link); err != nil {
 		return err
 	}
+	if err := l.attachGuarded(ctx, node, env); err != nil {
+		// a failure before the move leaves the link in the host netns
+		if hostLink, lookupErr := netlink.LinkByName(l.NodeEndpoint.GetRandIfaceName()); lookupErr == nil {
+			_ = netlink.LinkDel(hostLink)
+		}
+		return err
+	}
+	return nil
+}
 
+// attachGuarded moves the new macvlan into the node and brings it up behind its guard; a link
+// that cannot be guarded is deleted, never UP.
+func (l *LinkMacVlan) attachGuarded(ctx context.Context, node Node, env map[string]string) error {
 	// retrieve the Link by name
 	mvInterface, err := netlink.LinkByName(l.NodeEndpoint.GetRandIfaceName())
 	if err != nil {
@@ -189,8 +200,8 @@ func (l *LinkMacVlan) Deploy(ctx context.Context, _ Endpoint) error {
 		)
 	}
 
-	// add the link to the Node Namespace; a link that cannot be guarded is deleted, never UP
-	err = node.AddLinkToContainer(ctx, mvInterface, func(_ ns.NetNS) error {
+	// add the link to the Node Namespace
+	return node.AddLinkToContainer(ctx, mvInterface, func(_ ns.NetNS) error {
 		if err := setNameAndMAC(mvInterface, l.NodeEndpoint); err != nil {
 			_ = netlink.LinkDel(mvInterface)
 			return err
@@ -210,13 +221,6 @@ func (l *LinkMacVlan) Deploy(ctx context.Context, _ Endpoint) error {
 		}
 		return nil
 	})
-	if err != nil {
-		// a failure before the move leaves the link in the host netns
-		if hostLink, lookupErr := netlink.LinkByName(l.NodeEndpoint.GetRandIfaceName()); lookupErr == nil {
-			_ = netlink.LinkDel(hostLink)
-		}
-	}
-	return err
 }
 
 func (*LinkMacVlan) PostDeploy(context.Context) error {

@@ -36,6 +36,7 @@ const (
 	CloudIPInUse = "NG_CLOUD_IP_IN_USE"
 
 	cloudGuardTable    = "ng_cloud"
+	cloudSink          = "ngsink"
 	defaultCloudRateMB = 10
 )
 
@@ -87,22 +88,40 @@ func cloudGuardFromEnv(env map[string]string, dev string, mac net.HardwareAddr) 
 }
 
 // rules is one nft transaction: it replaces any table left from an earlier install.
+// Blocked frames go to the sink instead of being dropped: a drop in the egress hook returns
+// ENOBUFS to the sender, and iouyap stops forwarding every IOS port on a send error. A frame
+// stolen by fwd reports success and never reaches the uplink.
 func (g *cloudGuard) rules() string {
 	return fmt.Sprintf(`table netdev %[1]s
 delete table netdev %[1]s
 table netdev %[1]s {
 	chain out {
 		type filter hook egress device %[2]q priority 0; policy drop;
-		ether saddr != %[3]s drop
-		ip daddr %[5]s-%[6]s ip daddr != %[4]s drop
-		limit rate over %[7]d mbytes/second drop
-		ip saddr %[4]s udp sport { 67, 68 } drop
-		ip saddr %[4]s udp dport { 67, 68 } drop
+		ether saddr != %[3]s fwd to %[8]q
+		ip daddr %[5]s-%[6]s ip daddr != %[4]s fwd to %[8]q
+		limit rate over %[7]d mbytes/second fwd to %[8]q
+		ip saddr %[4]s udp sport { 67, 68 } fwd to %[8]q
+		ip saddr %[4]s udp dport { 67, 68 } fwd to %[8]q
 		ether type ip ip saddr %[4]s accept
 		ether type arp arp saddr ether %[3]s arp saddr ip %[4]s accept
+		fwd to %[8]q
 	}
 }
-`, cloudGuardTable, g.dev, g.mac, g.ip, g.poolFirst, g.poolLast, g.rateMB)
+`, cloudGuardTable, g.dev, g.mac, g.ip, g.poolFirst, g.poolLast, g.rateMB, cloudSink)
+}
+
+// ensureSink creates the dummy that swallows blocked frames in the calling thread's netns.
+func ensureSink() error {
+	l, err := netlink.LinkByName(cloudSink)
+	if err != nil {
+		if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: cloudSink}}); err != nil {
+			return fmt.Errorf("create %s: %w", cloudSink, err)
+		}
+		if l, err = netlink.LinkByName(cloudSink); err != nil {
+			return err
+		}
+	}
+	return netlink.LinkSetUp(l)
 }
 
 // currentNetnsPath names the netns of the calling thread; valid only inside ns.Do.
@@ -127,6 +146,9 @@ func nftIn(nsPath, stdin string, args ...string) (string, error) {
 // for ng-cloud-watch. The caller holds the cloud lock.
 func (g *cloudGuard) install() error {
 	nsPath := currentNetnsPath()
+	if err := ensureSink(); err != nil {
+		return err
+	}
 	if _, err := nftIn(nsPath, g.rules(), "-f", "-"); err != nil {
 		return err
 	}
@@ -185,6 +207,19 @@ func guardAndUp(link netlink.Link, env map[string]string) error {
 			return fmt.Errorf("macvlan %s: netns already has macvlan %s", g.dev, other.Attrs().Name)
 		}
 	}
+	var st unix.Stat_t
+	if err := unix.Stat(currentNetnsPath(), &st); err != nil {
+		return err
+	}
+	// a router restored after a stop or recreate gets no ARP probe, but must not come up on an
+	// address another router on this host took meanwhile
+	held, err := cloudIPHeldLocally(g.ip, st.Ino, g.dev)
+	if err != nil {
+		return err
+	}
+	if held {
+		return fmt.Errorf("%s %s", CloudIPInUse, g.ip)
+	}
 	if err := g.install(); err != nil {
 		return fmt.Errorf("macvlan %s: guard: %w", g.dev, err)
 	}
@@ -198,8 +233,10 @@ func nodeEnv(n Node) map[string]string {
 	return nil
 }
 
-// cloudIPHeldLocally reports whether a guarded macvlan on this host still uses ip.
-func cloudIPHeldLocally(ip netip.Addr) (bool, error) {
+// cloudIPHeldLocally reports whether a macvlan on this host, other than self (netns inode, dev),
+// carries a MAC a guard for ip was installed with. Parked and stopped routers count: their
+// macvlan sits DOWN in a parking netns with the same MAC. The caller holds the cloud lock.
+func cloudIPHeldLocally(ip netip.Addr, selfNs uint64, selfDev string) (bool, error) {
 	entries, err := os.ReadDir(CloudRegistryDir)
 	if errors.Is(err, os.ErrNotExist) {
 		return false, nil
@@ -207,60 +244,58 @@ func cloudIPHeldLocally(ip netip.Addr) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	live := liveNetnsByInode()
+	macs := map[string]bool{}
 	for _, e := range entries {
 		data, err := os.ReadFile(filepath.Join(CloudRegistryDir, e.Name()))
-		if err != nil || e.Name() == "lock" {
+		if err != nil {
 			continue
 		}
-		f := strings.Fields(string(data))
-		if len(f) != 4 || f[0] != ip.String() {
+		if f := strings.Fields(string(data)); len(f) == 4 && f[0] == ip.String() {
+			macs[f[1]] = true
+		}
+	}
+	if len(macs) == 0 {
+		return false, nil
+	}
+	paths, _ := filepath.Glob("/run/netns/*") // clab names every container and parking netns here
+	for _, p := range paths {
+		var st unix.Stat_t
+		if unix.Stat(p, &st) != nil {
 			continue
 		}
-		inode, _, _ := strings.Cut(e.Name(), "-")
-		nsPath, ok := live[inode]
-		if !ok {
+		h, err := ns.GetNS(p)
+		if err != nil {
 			continue
 		}
-		if macvlanPresent(nsPath, f[3], f[1]) {
+		held := false
+		_ = h.Do(func(ns.NetNS) error {
+			all, err := netlink.LinkList()
+			if err != nil {
+				return err
+			}
+			for _, l := range all {
+				if l.Type() != "macvlan" || !macs[l.Attrs().HardwareAddr.String()] {
+					continue
+				}
+				if st.Ino == selfNs && l.Attrs().Name == selfDev {
+					continue
+				}
+				held = true
+			}
+			return nil
+		})
+		h.Close()
+		if held {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
-// liveNetnsByInode maps netns inodes to the named netns clab keeps for containers and parking.
-func liveNetnsByInode() map[string]string {
-	live := map[string]string{}
-	paths, _ := filepath.Glob("/run/netns/*")
-	for _, p := range paths {
-		var st unix.Stat_t
-		if unix.Stat(p, &st) == nil {
-			live[strconv.FormatUint(st.Ino, 10)] = p
-		}
-	}
-	return live
-}
-
-func macvlanPresent(nsPath, dev, mac string) bool {
-	h, err := ns.GetNS(nsPath)
-	if err != nil {
-		return false
-	}
-	defer h.Close()
-	found := false
-	_ = h.Do(func(ns.NetNS) error {
-		l, err := netlink.LinkByName(dev)
-		found = err == nil && l.Type() == "macvlan" && l.Attrs().HardwareAddr.String() == mac
-		return nil
-	})
-	return found
-}
-
 // checkCloudIPFree fails with CloudIPInUse when ip is held by another macvlan on this host or
 // answers ARP on the host's uplink. The caller holds the cloud lock.
 func checkCloudIPFree(ctx context.Context, uplink string, ip netip.Addr) error {
-	held, err := cloudIPHeldLocally(ip)
+	held, err := cloudIPHeldLocally(ip, 0, "")
 	if err != nil {
 		return err
 	}

@@ -326,6 +326,16 @@ func moveLink(ctx context.Context, src Node, ifaceName string, dst Node) error {
 			return err
 		}
 
+		// NTG-249: a macvlan in flight between netns is invisible to the duplicate-address
+		// scan and the host watcher; both hold the same lock
+		if link.Type() == "macvlan" {
+			unlock, err := lockCloud()
+			if err != nil {
+				return err
+			}
+			defer unlock()
+		}
+
 		if err := netlink.LinkSetDown(link); err != nil {
 			return err
 		}

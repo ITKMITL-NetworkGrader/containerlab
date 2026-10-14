@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -295,7 +296,7 @@ func TestNetnsCloudGuardFiltersEgress(t *testing.T) {
 		"spoofed mac": arpFrom(spoofMAC, [4]byte{10, 70, 38, 200}),
 		"other ip":    arpFrom(testMAC, [4]byte{10, 70, 38, 13}),
 	}
-	dropped := map[string]bool{}
+	// "own" goes last: it must still leave after the router sent blocked frames
 	seen := capture(t, func() {
 		err := n.Do(func(ns.NetNS) error {
 			l, err := netlink.LinkByName("eth1")
@@ -308,12 +309,11 @@ func TestNetnsCloudGuardFiltersEgress(t *testing.T) {
 			}
 			defer unix.Close(fd)
 			sa := &unix.SockaddrLinklayer{Ifindex: l.Attrs().Index}
-			// a frame the egress hook drops comes back as ENOBUFS
-			for name, f := range frames {
-				if err := unix.Sendto(fd, f, 0, sa); err != nil && err != unix.ENOBUFS {
-					return err
-				} else if err != nil {
-					dropped[name] = true
+			// iouyap stops forwarding every IOS port on a send error, so a blocked frame must
+			// still report success
+			for _, name := range []string{"spoofed mac", "other ip", "own"} {
+				if err := unix.Sendto(fd, frames[name], 0, sa); err != nil {
+					return fmt.Errorf("send %s: %w", name, err)
 				}
 			}
 			return nil
@@ -333,8 +333,8 @@ func TestNetnsCloudGuardFiltersEgress(t *testing.T) {
 	if !got["own"] || got["spoofed mac"] || got["other ip"] {
 		t.Fatalf("frames out: %v (want only own)", got)
 	}
-	if dropped["own"] || !dropped["spoofed mac"] || !dropped["other ip"] {
-		t.Fatalf("dropped: %v", dropped)
+	if sink := linkIn(t, n, cloudSink); sink == nil || sink.Attrs().Statistics.TxPackets < 2 {
+		t.Fatalf("sink %+v", sink)
 	}
 }
 
@@ -368,25 +368,101 @@ func TestNetnsDeleteParkingNetnsTakesTheMacvlan(t *testing.T) {
 	if _, err := os.Stat(parkPath); !os.IsNotExist(err) {
 		t.Fatalf("parking netns still there: %v", err)
 	}
-	// the kernel frees a netns asynchronously
+	// macvlan refuses a second child with the same MAC on one parent: once the parked one is
+	// gone the MAC is free again (the kernel frees a netns asynchronously)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		held := false
-		all, _ := netlink.LinkList()
-		for _, l := range all {
-			if l.Attrs().ParentIndex == up.Attrs().Index && l.Attrs().Name != testUplink {
-				held = true
-			}
+		again := &netlink.Macvlan{
+			LinkAttrs: netlink.LinkAttrs{Name: "again0", ParentIndex: up.Attrs().Index, HardwareAddr: testMAC},
+			Mode:      netlink.MACVLAN_MODE_PRIVATE,
 		}
-		if !held {
+		err := netlink.LinkAdd(again)
+		if err == nil {
+			_ = netlink.LinkDel(again)
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("macvlan outlived its parking netns")
+			t.Fatalf("MAC still held after the parking netns was deleted: %v", err)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	if err := clabutils.DeleteParkingNetns("clab-zz-r1"); err != nil {
 		t.Fatalf("second delete: %v", err)
+	}
+}
+
+// A stopped or recreated router parks its macvlan DOWN; restore must reinstall the guard in the
+// new netns, and no other router may take the address while it is parked.
+func TestNetnsCloudParkAndRestore(t *testing.T) {
+	netnsSetup(t)
+	node, _ := newNodeNS(t, testEnv())
+	link := newCloudLink(node)
+	if err := link.Deploy(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.AddEndpoint(link.NodeEndpoint); err != nil {
+		t.Fatal(err)
+	}
+	parkPath, err := clabutils.CreateNamedNetNS(clabutils.ParkingNetnsName("clab-zz-park-r1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = clabutils.DeleteParkingNetns("clab-zz-park-r1") })
+	park := NewParkingNode("clab-zz-park-r1", parkPath)
+	if err := park.CaptureFrom(context.Background(), node); err != nil {
+		t.Fatal(err)
+	}
+
+	// another router asks for the same address while this one is parked
+	other, _ := newNodeNS(t, testEnv())
+	otherLink := newCloudLink(other)
+	otherLink.NodeEndpoint.(*EndpointMacVlan).MAC = net.HardwareAddr{0xaa, 0xbb, 0xcc, 0x00, 0xc8, 0x01}
+	err = otherLink.Deploy(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), CloudIPInUse) {
+		t.Fatalf("deployed over a parked router: %v", err)
+	}
+
+	// the node comes back in a fresh netns, as after a recreate
+	_, fresh := newNodeNS(t, nil)
+	node.nspath = fresh.Path()
+	if _, err := park.RestoreTo(context.Background(), node); err != nil {
+		t.Fatal(err)
+	}
+	l := linkIn(t, fresh, "eth1")
+	if l == nil || l.Attrs().Flags&net.FlagUp == 0 {
+		t.Fatalf("not restored up: %+v", l)
+	}
+	if !strings.Contains(nftList(t, fresh), `egress device "eth1"`) {
+		t.Fatal("restored without a guard")
+	}
+}
+
+// A router coming back from a stop must not go up on an address another router took meanwhile.
+func TestNetnsCloudActivateRefusesAddressHeldLocally(t *testing.T) {
+	netnsSetup(t)
+	holder, _ := newNodeNS(t, testEnv())
+	if err := newCloudLink(holder).Deploy(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	node, n := newNodeNS(t, testEnv())
+	link := newCloudLink(node)
+	up, _ := netlink.LinkByName(testUplink)
+	mv := &netlink.Macvlan{
+		LinkAttrs: netlink.LinkAttrs{Name: "eth1", ParentIndex: up.Attrs().Index,
+			HardwareAddr: net.HardwareAddr{0xaa, 0xbb, 0xcc, 0x00, 0xc8, 0x01}},
+		Mode: netlink.MACVLAN_MODE_PRIVATE,
+	}
+	if err := netlink.LinkAdd(mv); err != nil {
+		t.Fatal(err)
+	}
+	if err := netlink.LinkSetNsFd(mv, int(n.Fd())); err != nil {
+		t.Fatal(err)
+	}
+	err := link.NodeEndpoint.Activate(context.Background())
+	if err == nil || !strings.Contains(err.Error(), CloudIPInUse) {
+		t.Fatalf("err %v", err)
+	}
+	if l := linkIn(t, n, "eth1"); l.Attrs().Flags&net.FlagUp != 0 {
+		t.Fatal("came up")
 	}
 }

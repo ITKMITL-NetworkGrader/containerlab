@@ -72,6 +72,13 @@ func (c *CLab) Destroy(ctx context.Context, options ...DestroyOption) (err error
 	}()
 
 	if len(topos) == 0 {
+		// no containers left, e.g. a recreate whose replacement failed to deploy: the nodes'
+		// parked links (a macvlan holds its MAC on the host) are all that remains (NTG-249)
+		for _, n := range c.Nodes {
+			if err := clabutils.DeleteParkingNetns(n.Config().LongName); err != nil {
+				log.Errorf("could not remove parking netns of %q: %v", n.Config().LongName, err)
+			}
+		}
 		return nil
 	}
 

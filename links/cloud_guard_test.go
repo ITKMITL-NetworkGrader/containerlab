@@ -26,13 +26,14 @@ delete table netdev ng_cloud
 table netdev ng_cloud {
 	chain out {
 		type filter hook egress device "eth1" priority 0; policy drop;
-		ether saddr != aa:bb:cc:00:c8:10 drop
-		ip daddr 10.70.38.200-10.70.38.209 ip daddr != 10.70.38.200 drop
-		limit rate over 10 mbytes/second drop
-		ip saddr 10.70.38.200 udp sport { 67, 68 } drop
-		ip saddr 10.70.38.200 udp dport { 67, 68 } drop
+		ether saddr != aa:bb:cc:00:c8:10 fwd to "ngsink"
+		ip daddr 10.70.38.200-10.70.38.209 ip daddr != 10.70.38.200 fwd to "ngsink"
+		limit rate over 10 mbytes/second fwd to "ngsink"
+		ip saddr 10.70.38.200 udp sport { 67, 68 } fwd to "ngsink"
+		ip saddr 10.70.38.200 udp dport { 67, 68 } fwd to "ngsink"
 		ether type ip ip saddr 10.70.38.200 accept
 		ether type arp arp saddr ether aa:bb:cc:00:c8:10 arp saddr ip 10.70.38.200 accept
+		fwd to "ngsink"
 	}
 }
 `
@@ -48,7 +49,7 @@ func TestCloudGuardRate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(g.rules(), "limit rate over 25 mbytes/second drop") {
+	if !strings.Contains(g.rules(), "limit rate over 25 mbytes/second fwd to \"ngsink\"") {
 		t.Fatal(g.rules())
 	}
 }
