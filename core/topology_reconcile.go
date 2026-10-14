@@ -43,6 +43,7 @@ type applyPlan struct {
 	staleEndpoints     []applyEndpointRef
 	desiredEndpointSet map[applyEndpointKey]struct{}
 	liveEndpointSet    map[applyEndpointKey]struct{}
+	liveMacvlanSet     map[applyEndpointKey]struct{}
 	endpointNodes      map[string]clablinks.Node
 	state              *LabState
 	parkedNodeSet      map[string]struct{}
@@ -77,6 +78,7 @@ func newApplyPlan(currentNodes map[string]*runtimeNodeGroup, state *LabState) *a
 		plannedLinkSet:     map[int]struct{}{},
 		desiredEndpointSet: map[applyEndpointKey]struct{}{},
 		liveEndpointSet:    map[applyEndpointKey]struct{}{},
+		liveMacvlanSet:     map[applyEndpointKey]struct{}{},
 		endpointNodes:      map[string]clablinks.Node{},
 		state:              state,
 		nodeChangeReasons:  map[string]string{},
@@ -397,7 +399,7 @@ func (c *CLab) discoverLiveApplyEndpoints(
 
 		plan.setEndpointNode(nodeName, n)
 
-		ifaceNames, err := clablinks.DiscoverOwnedInterfaceNames(
+		ifaceNames, macvlans, err := clablinks.DiscoverOwnedInterfaces(
 			ctx,
 			n,
 			c.applyKnownEndpointNames(plan, nodeName),
@@ -412,6 +414,9 @@ func (c *CLab) discoverLiveApplyEndpoints(
 
 		for _, ifaceName := range ifaceNames {
 			plan.liveEndpointSet[applyEndpointKey{node: nodeName, iface: ifaceName}] = struct{}{}
+			if macvlans[ifaceName] {
+				plan.liveMacvlanSet[applyEndpointKey{node: nodeName, iface: ifaceName}] = struct{}{}
+			}
 		}
 	}
 
@@ -694,6 +699,8 @@ func (c *CLab) reconcileNodes(ctx context.Context, plan *applyPlan) error {
 }
 
 func (p *applyPlan) linkNeedsDeploy(link clablinks.Link) bool {
+	// NTG-249: a port that is a cable now and should be a Cloud (or the reverse) is a new link
+	_, wantMacvlan := link.(*clablinks.LinkMacVlan)
 	for _, ep := range clablinks.RuntimeEndpoints(link) {
 		key := endpointKeyFromEndpoint(ep)
 		if _, parked := p.parkedNodeSet[key.node]; !parked {
@@ -702,6 +709,9 @@ func (p *applyPlan) linkNeedsDeploy(link clablinks.Link) bool {
 			}
 		}
 		if _, live := p.liveEndpointSet[key]; !live {
+			return true
+		}
+		if _, isMacvlan := p.liveMacvlanSet[key]; isMacvlan != wantMacvlan {
 			return true
 		}
 	}
