@@ -98,6 +98,8 @@ type iol struct {
 	firstBoot         bool
 	// bootCfgWritten is set when PreDeploy rendered the complete boot config (NTG-180).
 	bootCfgWritten bool
+	// parkedEndpoints are the links apply parked before recreating this node (NTG-263).
+	parkedEndpoints []clablinks.Endpoint
 }
 
 func (n *iol) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) error {
@@ -294,6 +296,31 @@ func (n *iol) postDeployBootConfig(ctx context.Context) error {
 	return n.GenBootConfig(ctx)
 }
 
+// ParkEndpoints remembers the links before parking releases them from the node (NTG-263).
+func (n *iol) ParkEndpoints(ctx context.Context) error {
+	n.rememberParkedEndpoints()
+	return n.DefaultNode.ParkEndpoints(ctx)
+}
+
+// NTG-263: parking releases a node's links, and the recreated IOL writes NETMAP before they come
+// back. IOL and iouyap read NETMAP only at boot, so it must list the parked links too.
+func (n *iol) rememberParkedEndpoints() {
+	n.parkedEndpoints = append([]clablinks.Endpoint(nil), n.Endpoints...)
+}
+
+// interfaceEndpoints is every link the booting node will have: parked ones and current ones.
+func (n *iol) interfaceEndpoints() []clablinks.Endpoint {
+	seen := map[string]bool{}
+	var eps []clablinks.Endpoint
+	for _, ep := range append(append([]clablinks.Endpoint(nil), n.parkedEndpoints...), n.Endpoints...) {
+		if !seen[ep.GetIfaceName()] {
+			seen[ep.GetIfaceName()] = true
+			eps = append(eps, ep)
+		}
+	}
+	return eps
+}
+
 // Generate interfaces configuration for IOL (and iouyap/netmap).
 func (n *iol) GenInterfaceConfig(_ context.Context) error {
 	// add default 'boilerplate' to NETMAP and iouyap.ini for management port (e0/0)
@@ -311,7 +338,7 @@ func (n *iol) GenInterfaceConfig(_ context.Context) error {
 	// Regexp to pull number out of linux'ethX' interface naming
 	IntfRegExpr := regexp.MustCompile(`\d+`)
 
-	for _, intf := range n.Endpoints {
+	for _, intf := range n.interfaceEndpoints() {
 		// get numeric interface number and cast to int
 		x, _ := strconv.Atoi(IntfRegExpr.FindString(intf.GetIfaceName()))
 
