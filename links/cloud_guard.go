@@ -113,9 +113,12 @@ func currentNetnsPath() string {
 func nftIn(nsPath, stdin string, args ...string) (string, error) {
 	cmd := exec.Command("nsenter", append([]string{"--net=" + nsPath, "nft"}, args...)...)
 	cmd.Stdin = strings.NewReader(stdin)
-	out, err := cmd.CombinedOutput()
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	// stdout only: ng-cloud-watch hashes the same listing
+	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, out)
+		return "", fmt.Errorf("nft %s: %w: %s", strings.Join(args, " "), err, stderr.String())
 	}
 	return string(out), nil
 }
