@@ -209,6 +209,16 @@ func CreateOrGetNamedNetNS(name string) (string, error) {
 	return CreateNamedNetNS(name)
 }
 
+// DeleteParkingNetns removes a gone node's parking netns, if any. Interfaces parked there die
+// with it; a parked macvlan would otherwise keep its MAC on the host (NTG-249).
+func DeleteParkingNetns(containerName string) error {
+	name := ParkingNetnsName(strings.TrimPrefix(containerName, "/"))
+	if _, err := GetNamedNetNS(name); err != nil {
+		return nil
+	}
+	return netns.DeleteNamed(name)
+}
+
 func GetNamedNetNS(name string) (string, error) {
 	nsPath := filepath.Join("/run/netns", name)
 	if !FileOrDirExists(nsPath) {

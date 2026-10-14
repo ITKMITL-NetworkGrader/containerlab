@@ -564,45 +564,7 @@ const (
 // and return a function that can run in the netns.Do() call for execution in a network namespace.
 func SetNameMACAndUpInterface(l netlink.Link, endpt Endpoint) func(ns.NetNS) error {
 	return func(_ ns.NetNS) error {
-		// rename the link created with random name if its length is acceptable by linux
-		if IsValidInterfaceName(endpt.GetIfaceName()) {
-			err := netlink.LinkSetName(l, endpt.GetIfaceName())
-			if err != nil {
-				return fmt.Errorf(
-					"failed to rename link: %v", err)
-			}
-		} else {
-			// when the name is too long, we add a sanitized interface name as AltName
-			sanitizedIfaceName := clabutils.SanitizeInterfaceName(endpt.GetIfaceName())
-			err := netlink.LinkAddAltName(l, sanitizedIfaceName)
-			if err != nil {
-				return fmt.Errorf(
-					"failed to add altname: %v", err)
-			}
-		}
-
-		// lets set the MAC address if provided
-		if len(endpt.GetMac()) == 6 {
-			err := netlink.LinkSetHardwareAddr(l, endpt.GetMac())
-			if err != nil {
-				return err
-			}
-		}
-
-		if endpt.GetIfaceAlias() != "" {
-			err := netlink.LinkSetAlias(l, endpt.GetIfaceAlias())
-			if err != nil {
-				return err
-			}
-			// Set a sanitized altname for ease of access. '/', and ' ' are changed to '-'
-			sanitizedIfaceName := clabutils.SanitizeInterfaceName(endpt.GetIfaceAlias())
-			err = netlink.LinkAddAltName(l, sanitizedIfaceName)
-			if err != nil {
-				return err
-			}
-		}
-
-		if err := addOwnershipAltName(l, endpt); err != nil {
+		if err := setNameAndMAC(l, endpt); err != nil {
 			return err
 		}
 
@@ -614,6 +576,49 @@ func SetNameMACAndUpInterface(l netlink.Link, endpt Endpoint) func(ns.NetNS) err
 
 		return nil
 	}
+}
+
+// setNameAndMAC names the link, sets its MAC and alias, and marks its ownership; it stays down.
+func setNameAndMAC(l netlink.Link, endpt Endpoint) error {
+	// rename the link created with random name if its length is acceptable by linux
+	if IsValidInterfaceName(endpt.GetIfaceName()) {
+		err := netlink.LinkSetName(l, endpt.GetIfaceName())
+		if err != nil {
+			return fmt.Errorf(
+				"failed to rename link: %v", err)
+		}
+	} else {
+		// when the name is too long, we add a sanitized interface name as AltName
+		sanitizedIfaceName := clabutils.SanitizeInterfaceName(endpt.GetIfaceName())
+		err := netlink.LinkAddAltName(l, sanitizedIfaceName)
+		if err != nil {
+			return fmt.Errorf(
+				"failed to add altname: %v", err)
+		}
+	}
+
+	// lets set the MAC address if provided
+	if len(endpt.GetMac()) == 6 {
+		err := netlink.LinkSetHardwareAddr(l, endpt.GetMac())
+		if err != nil {
+			return err
+		}
+	}
+
+	if endpt.GetIfaceAlias() != "" {
+		err := netlink.LinkSetAlias(l, endpt.GetIfaceAlias())
+		if err != nil {
+			return err
+		}
+		// Set a sanitized altname for ease of access. '/', and ' ' are changed to '-'
+		sanitizedIfaceName := clabutils.SanitizeInterfaceName(endpt.GetIfaceAlias())
+		err = netlink.LinkAddAltName(l, sanitizedIfaceName)
+		if err != nil {
+			return err
+		}
+	}
+
+	return addOwnershipAltName(l, endpt)
 }
 
 func ownershipAltName(endpt Endpoint) string {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/charmbracelet/log"
+	"github.com/containernetworking/plugins/pkg/ns"
 	clabconstants "github.com/srl-labs/containerlab/constants"
 	"github.com/vishvananda/netlink"
 )
@@ -137,6 +138,23 @@ func (l *LinkMacVlan) Deploy(ctx context.Context, _ Endpoint) error {
 		return err
 	}
 
+	// NTG-249: every macvlan on this host goes UP only behind a guard; check its inputs and
+	// that the address is free before creating anything.
+	node := l.NodeEndpoint.GetNode()
+	env := nodeEnv(node)
+	g, err := cloudGuardFromEnv(env, l.NodeEndpoint.GetIfaceName(), l.NodeEndpoint.GetMac())
+	if err != nil {
+		return fmt.Errorf("node %s: %w", node.GetShortName(), err)
+	}
+	unlock, err := lockCloud()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := checkCloudIPFree(ctx, l.HostEndpoint.GetIfaceName(), g.ip); err != nil {
+		return fmt.Errorf("node %s: %w", node.GetShortName(), err)
+	}
+
 	log.Infof("Creating MACVLAN link: %s <--> %s", l.HostEndpoint, l.NodeEndpoint)
 
 	// build Netlink Macvlan struct
@@ -171,9 +189,33 @@ func (l *LinkMacVlan) Deploy(ctx context.Context, _ Endpoint) error {
 		)
 	}
 
-	// add the link to the Node Namespace
-	err = l.NodeEndpoint.GetNode().AddLinkToContainer(ctx, mvInterface,
-		SetNameMACAndUpInterface(mvInterface, l.NodeEndpoint))
+	// add the link to the Node Namespace; a link that cannot be guarded is deleted, never UP
+	err = node.AddLinkToContainer(ctx, mvInterface, func(_ ns.NetNS) error {
+		if err := setNameAndMAC(mvInterface, l.NodeEndpoint); err != nil {
+			_ = netlink.LinkDel(mvInterface)
+			return err
+		}
+		name := l.NodeEndpoint.GetIfaceName()
+		if !IsValidInterfaceName(name) {
+			name = l.NodeEndpoint.GetRandIfaceName()
+		}
+		named, err := netlink.LinkByName(name)
+		if err != nil {
+			_ = netlink.LinkDel(mvInterface)
+			return err
+		}
+		if err := guardAndUp(named, env); err != nil {
+			_ = netlink.LinkDel(named)
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		// a failure before the move leaves the link in the host netns
+		if hostLink, lookupErr := netlink.LinkByName(l.NodeEndpoint.GetRandIfaceName()); lookupErr == nil {
+			_ = netlink.LinkDel(hostLink)
+		}
+	}
 	return err
 }
 

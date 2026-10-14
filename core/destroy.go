@@ -365,6 +365,11 @@ func (c *CLab) deleteApplyNodes(ctx context.Context, plan *applyPlan) error {
 			}
 
 			_ = clabutils.DeleteNetnsSymlink(ctr.Names[0])
+			if _, recreate := plan.recreatedNodeSet[nodeName]; !recreate {
+				if err := clabutils.DeleteParkingNetns(ctr.Names[0]); err != nil {
+					log.Warn("failed deleting parking netns", "node", nodeName, "error", err)
+				}
+			}
 		}
 	}
 
@@ -390,6 +395,9 @@ func (c *CLab) deleteNodes(ctx context.Context, workers uint) {
 				err := n.Delete(ctx)
 				if err != nil {
 					log.Errorf("could not remove container %q: %v", n.Config().LongName, err)
+				}
+				if err := clabutils.DeleteParkingNetns(n.Config().LongName); err != nil {
+					log.Errorf("could not remove parking netns of %q: %v", n.Config().LongName, err)
 				}
 			case <-ctx.Done():
 				return
@@ -440,6 +448,9 @@ func (c *CLab) deleteContainersDirect(
 		err := c.globalRuntime().DeleteContainer(ctx, name)
 		if err != nil {
 			log.Errorf("could not remove container %q: %v", name, err)
+		}
+		if err := clabutils.DeleteParkingNetns(name); err != nil {
+			log.Errorf("could not remove parking netns of %q: %v", name, err)
 		}
 	}
 }

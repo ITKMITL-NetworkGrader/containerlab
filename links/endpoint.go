@@ -221,14 +221,27 @@ func moveEndpoint(ctx context.Context, e Endpoint, dst Node) error {
 	return nil
 }
 
-// Activate brings the endpoint's interface up in its current namespace.
+// Activate brings the endpoint's interface up in its current namespace. A macvlan (read from
+// netlink: endpoints discovered at runtime carry no link metadata) gets its guard first (NTG-249).
 func (e *EndpointGeneric) Activate(ctx context.Context) error {
+	env := nodeEnv(e.GetNode())
 	return e.GetNode().ExecFunction(ctx, func(_ ns.NetNS) error {
 		link, err := netlink.LinkByName(e.GetIfaceName())
 		if err != nil {
 			return err
 		}
-		return netlink.LinkSetUp(link)
+		if link.Type() != "macvlan" {
+			return netlink.LinkSetUp(link)
+		}
+		unlock, err := lockCloud()
+		if err != nil {
+			return err
+		}
+		defer unlock()
+		if err := guardAndUp(link, env); err != nil {
+			return fmt.Errorf("node %s: %w", e.GetNode().GetShortName(), err)
+		}
+		return nil
 	})
 }
 

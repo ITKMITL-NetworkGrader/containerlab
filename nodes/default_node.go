@@ -1090,6 +1090,11 @@ func (*DefaultNode) GetLinkEndpointType() clablinks.LinkEndpointType {
 	return clablinks.LinkEndpointTypeVeth
 }
 
+// GetEnv lets links read a node's env (NTG-249 cloud guard) without importing nodes.
+func (d *DefaultNode) GetEnv() map[string]string {
+	return d.Cfg.Env
+}
+
 func (d *DefaultNode) GetShortName() string {
 	return d.Cfg.ShortName
 }

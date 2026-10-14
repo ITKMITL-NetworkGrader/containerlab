@@ -112,7 +112,7 @@ func (n *iol) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) erro
 
 	nodeType := strings.ToLower(n.Cfg.NodeType)
 
-	pid, err := iolPid(n.Cfg.MgmtIPv4Address, n.Cfg.Index)
+	pid, err := iolPid(n.Cfg.Env, n.Cfg.MgmtIPv4Address, n.Cfg.Index)
 	if err != nil {
 		return fmt.Errorf("node %s: %w", n.Cfg.ShortName, err)
 	}
@@ -650,7 +650,18 @@ func (n *iol) SaveConfig(ctx context.Context) (*clabnodes.SaveConfigResult, erro
 // an earlier name changed it. The pinned mgmt address does not change for the node's lifetime and
 // is unique in the lab (the last octet is, on the /24 mgmt subnets NetGrader uses); 513+host keeps clear of the old PIDs (1..nodes) still running and of
 // iouyap's 513.
-func iolPid(mgmtIPv4 string, index int) (int, error) {
+//
+// NTG-249: a router on the faculty LAN takes NG_IOL_PID, the last octet of its cloud address,
+// because IOL derives interface MACs from the PID and the macvlan must carry a MAC no other lab
+// uses. 1-254 keeps clear of 513 and the 514-767 range above.
+func iolPid(env map[string]string, mgmtIPv4 string, index int) (int, error) {
+	if v, ok := env["NG_IOL_PID"]; ok {
+		pid, err := strconv.Atoi(v)
+		if err != nil || pid < 1 || pid > 254 {
+			return 0, fmt.Errorf("NG_IOL_PID %q must be 1-254", v)
+		}
+		return pid, nil
+	}
 	if ip := net.ParseIP(mgmtIPv4).To4(); ip != nil && ip[3] >= 1 && ip[3] <= 254 {
 		return 513 + int(ip[3]), nil
 	}
