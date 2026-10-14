@@ -113,6 +113,10 @@ table netdev %[1]s {
 // ensureSink creates the dummy that swallows blocked frames in the calling thread's netns.
 func ensureSink() error {
 	l, err := netlink.LinkByName(cloudSink)
+	if err == nil && l.Type() != "dummy" {
+		// anything else could carry blocked frames somewhere
+		return fmt.Errorf("%s exists and is a %s, not a dummy", cloudSink, l.Type())
+	}
 	if err != nil {
 		if err := netlink.LinkAdd(&netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: cloudSink}}); err != nil {
 			return fmt.Errorf("create %s: %w", cloudSink, err)
@@ -171,6 +175,15 @@ func (g *cloudGuard) install() error {
 
 func cloudRegistryPath(nsInode uint64, dev string) string {
 	return filepath.Join(CloudRegistryDir, fmt.Sprintf("%d-%s", nsInode, dev))
+}
+
+// currentCloudRecord is the registry path for dev in the calling thread's netns.
+func currentCloudRecord(dev string) (string, error) {
+	var st unix.Stat_t
+	if err := unix.Stat(currentNetnsPath(), &st); err != nil {
+		return "", err
+	}
+	return cloudRegistryPath(st.Ino, dev), nil
 }
 
 // lockCloud serializes guard installs with ng-cloud-watch, which holds the same lock.

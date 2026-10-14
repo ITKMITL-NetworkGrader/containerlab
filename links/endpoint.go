@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 
 	"github.com/charmbracelet/log"
@@ -327,13 +328,19 @@ func moveLink(ctx context.Context, src Node, ifaceName string, dst Node) error {
 		}
 
 		// NTG-249: a macvlan in flight between netns is invisible to the duplicate-address
-		// scan and the host watcher; both hold the same lock
-		if link.Type() == "macvlan" {
+		// scan and the host watcher; both hold the same lock. Its record moves with it, or
+		// the watcher prunes it with the old netns and the parked address is up for grabs.
+		isMacvlan := link.Type() == "macvlan"
+		var record string
+		if isMacvlan {
 			unlock, err := lockCloud()
 			if err != nil {
 				return err
 			}
 			defer unlock()
+			if record, err = currentCloudRecord(ifaceName); err != nil {
+				return err
+			}
 		}
 
 		if err := netlink.LinkSetDown(link); err != nil {
@@ -341,6 +348,16 @@ func moveLink(ctx context.Context, src Node, ifaceName string, dst Node) error {
 		}
 
 		return dst.AddLinkToContainer(ctx, link, func(_ ns.NetNS) error {
+			if !isMacvlan {
+				return nil
+			}
+			moved, err := currentCloudRecord(ifaceName)
+			if err != nil {
+				return err
+			}
+			if err := os.Rename(record, moved); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 			return nil
 		})
 	})

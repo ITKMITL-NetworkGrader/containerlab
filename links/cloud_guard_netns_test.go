@@ -412,6 +412,14 @@ func TestNetnsCloudParkAndRestore(t *testing.T) {
 	if err := park.CaptureFrom(context.Background(), node); err != nil {
 		t.Fatal(err)
 	}
+	// the record follows the link, or the watcher prunes it with the old netns
+	var parkSt unix.Stat_t
+	if err := unix.Stat(parkPath, &parkSt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(cloudRegistryPath(parkSt.Ino, "eth1")); err != nil {
+		t.Fatalf("record did not move to the parking netns: %v", err)
+	}
 
 	// another router asks for the same address while this one is parked
 	other, _ := newNodeNS(t, testEnv())
@@ -464,5 +472,22 @@ func TestNetnsCloudActivateRefusesAddressHeldLocally(t *testing.T) {
 	}
 	if l := linkIn(t, n, "eth1"); l.Attrs().Flags&net.FlagUp != 0 {
 		t.Fatal("came up")
+	}
+}
+
+// A device already named like the sink could carry blocked frames somewhere.
+func TestNetnsCloudRefusesANonDummySink(t *testing.T) {
+	netnsSetup(t)
+	node, n := newNodeNS(t, testEnv())
+	if err := n.Do(func(ns.NetNS) error {
+		return netlink.LinkAdd(&netlink.Veth{LinkAttrs: netlink.LinkAttrs{Name: cloudSink}, PeerName: "peer0"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := newCloudLink(node).Deploy(context.Background(), nil); err == nil {
+		t.Fatal("deployed with a veth as the sink")
+	}
+	if linkIn(t, n, "eth1") != nil {
+		t.Fatal("left eth1")
 	}
 }
