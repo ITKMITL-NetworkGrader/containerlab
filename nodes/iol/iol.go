@@ -391,8 +391,15 @@ func (n *iol) GenInterfaceConfig(_ context.Context) error {
 	return err
 }
 
+// consoleCfgTemplate (NTG-260): a console node is reached over con0, so it gets no admin user,
+// vty/SSH or mgmt address (its Ethernet0/0 is not wired).
+const consoleCfgTemplate = "hostname {{ .Hostname }}\n!\n{{ .PartialCfg }}\nend\n"
+
 func (n *iol) GenBootConfig(_ context.Context) error {
 	n.bootCfg = cfgTemplate
+	if n.consoleMode() {
+		n.bootCfg = consoleCfgTemplate
+	}
 
 	if n.Cfg.StartupConfig != "" {
 		cfg, err := os.ReadFile(n.Cfg.StartupConfig)
@@ -622,7 +629,7 @@ func (n *iol) saveOverConsole(ctx context.Context) error {
 		return fmt.Errorf("console save failed: %w", err)
 	}
 	if res.GetReturnCode() != 0 {
-		return fmt.Errorf("console save failed: %s", strings.TrimSpace(res.GetStdErrString()))
+		return fmt.Errorf("console save failed (exit %d): %s", res.GetReturnCode(), strings.TrimSpace(res.GetStdErrString()))
 	}
 	if err := writeMemoryResult(res.GetStdOutString(), nil); err != nil {
 		return err
