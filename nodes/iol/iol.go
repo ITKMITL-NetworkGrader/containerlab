@@ -12,8 +12,10 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -24,6 +26,7 @@ import (
 	"github.com/charmbracelet/log"
 	"github.com/scrapli/scrapligo/driver/options"
 	"github.com/scrapli/scrapligo/platform"
+	"github.com/scrapli/scrapligo/transport"
 	clabconstants "github.com/srl-labs/containerlab/constants"
 	clabexec "github.com/srl-labs/containerlab/exec"
 	clablinks "github.com/srl-labs/containerlab/links"
@@ -651,6 +654,9 @@ func (n *iol) SaveConfig(ctx context.Context) (*clabnodes.SaveConfigResult, erro
 		return nil, fmt.Errorf("failed to fetch network driver from the platform; error: %+v", err)
 	}
 
+	// Before Open, so an Open that spawned ssh and then failed is reaped too.
+	defer reapSSH(d.Transport)
+
 	err = d.Open()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open driver; error: %+v", err)
@@ -795,4 +801,25 @@ func copyFileAtomic(src, dst string) (err error) {
 		return err
 	}
 	return os.Rename(tmp, dst)
+}
+
+// reapSSH waits for the ssh child of scrapligo's system transport. scrapligo v1's Close kills
+// ssh but never waits for it, which left one zombie under clab-api-server per save (NTG-255).
+// ponytail: reads scrapligo's unexported cmd field; if a version renames it this is a no-op and
+// TestReapSystemTransportLeavesNoZombie fails. Drop it when scrapligo waits in Close.
+func reapSSH(tr *transport.Transport) {
+	sys, ok := tr.Impl.(*transport.System)
+	if !ok {
+		return
+	}
+	f := reflect.ValueOf(sys).Elem().FieldByName("c")
+	if !f.IsValid() || f.Kind() != reflect.Pointer || f.IsNil() {
+		return
+	}
+	cmd := (*exec.Cmd)(f.UnsafePointer())
+	if cmd.Process == nil || cmd.ProcessState != nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+	_ = cmd.Wait()
 }
