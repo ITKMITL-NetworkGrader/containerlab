@@ -74,3 +74,33 @@ func TestReapSystemTransportLeavesNoZombie(t *testing.T) {
 	}
 	reapSSH(tr) // a second call (or one after an Open that never spawned) must not block or panic
 }
+
+// A failed Open either never spawned (nothing to reap) or spawned a child that already exited
+// without a Close; both must leave no zombie and must not panic.
+func TestReapSystemTransportAfterFailedOpen(t *testing.T) {
+	if _, err := os.Stat("/proc/self/task"); err != nil {
+		t.Skip("needs /proc")
+	}
+	l, err := logging.NewInstance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bin := range []string{"/nonexistent-ntg255", "true"} {
+		tr, err := transport.NewTransport(l, "localhost", transport.SystemTransport)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sys := tr.Impl.(*transport.System)
+		sys.OpenBin, sys.OpenArgs = bin, []string{"x"} // non-empty, so scrapligo skips building ssh args
+		_ = tr.Open()
+		for i := 0; i < 100 && bin == "true" && len(zombieChildren(t)) == 0; i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		reapSSH(tr)
+
+		if z := zombieChildren(t); len(z) != 0 {
+			t.Fatalf("%s: zombie children left after reapSSH: %v", bin, z)
+		}
+	}
+}
