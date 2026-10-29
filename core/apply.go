@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	clablinks "github.com/srl-labs/containerlab/links"
 )
@@ -202,7 +203,11 @@ func (c *CLab) apply(
 		return nil, err
 	}
 
-	if err := c.deployLinks(ctx, plan.addedLinks, deployNodeNames); err != nil {
+	if err := c.deployLinks(
+		ctx,
+		plan.addedLinks,
+		slices.Concat(deployNodeNames, plan.keptStaleEndpointNodeNames()),
+	); err != nil {
 		return nil, err
 	}
 
@@ -279,4 +284,25 @@ func (*CLab) removeApplyLinkEndpoints(ctx context.Context, links []clablinks.Lin
 	}
 
 	return nil
+}
+
+// keptStaleEndpointNodeNames are the nodes that lost a link in this apply and keep their container,
+// so their PostDeployEndpoints can drop it from the node's own dataplane config (NTG-333).
+func (p *applyPlan) keptStaleEndpointNodeNames() []string {
+	var names []string
+	for _, ref := range p.staleEndpoints {
+		name := ref.key.node
+		kept := true
+		for _, set := range []map[string]struct{}{
+			p.addedNodeSet, p.deletedNodeSet, p.recreatedNodeSet, p.startNodeSet,
+		} {
+			if _, ok := set[name]; ok {
+				kept = false
+			}
+		}
+		if kept {
+			names = append(names, name)
+		}
+	}
+	return names
 }

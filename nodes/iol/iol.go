@@ -103,6 +103,10 @@ type iol struct {
 	bootCfgWritten bool
 	// parkedEndpoints are the links apply parked before recreating this node (NTG-263).
 	parkedEndpoints []clablinks.Endpoint
+	// created is set when this run creates the container: its entrypoint starts iouyap (NTG-333).
+	created                      bool
+	fixedSlotsN, runningSlotsN   int
+	fixedSlotsOK, runningSlotsOK bool
 }
 
 func (n *iol) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) error {
@@ -167,6 +171,7 @@ func (n *iol) PreDeploy(ctx context.Context, params *clabnodes.PreDeployParams) 
 		return err
 	}
 
+	n.created = true
 	return n.CreateIOLFiles(ctx)
 }
 
@@ -233,6 +238,10 @@ func (n *iol) CreateIOLFiles(ctx context.Context) error {
 	// create these files so the bind monut doesn't automatically
 	// make folders.
 	clabutils.CreateFile(path.Join(n.Cfg.LabDir, "boot_config.txt"), "")
+
+	if s := n.fixedSlots(ctx); s > 0 && n.Cfg.Env[envNumSlots] == "" {
+		n.Cfg.Env = clabutils.MergeStringMaps(n.Cfg.Env, map[string]string{envNumSlots: strconv.Itoa(s)})
+	}
 
 	if err := n.GenInterfaceConfig(ctx); err != nil {
 		return err
@@ -326,9 +335,22 @@ func (n *iol) interfaceEndpoints() []clablinks.Endpoint {
 
 // Generate interfaces configuration for IOL (and iouyap/netmap).
 func (n *iol) GenInterfaceConfig(_ context.Context) error {
+	iouyapData, netmapdata := n.interfaceConfig()
+
+	// create IOUYAP and NETMAP file for interface mappings
+	err := clabutils.CreateFile(path.Join(n.Cfg.LabDir, "iouyap.ini"), iouyapData)
+	if err != nil {
+		return err
+	}
+	err = clabutils.CreateFile(path.Join(n.Cfg.LabDir, "NETMAP"), netmapdata)
+
+	return err
+}
+
+// interfaceConfig renders iouyap.ini and NETMAP and refills n.interfaces for the boot config.
+func (n *iol) interfaceConfig() (iouyapData, netmapdata string) {
 	// add default 'boilerplate' to NETMAP and iouyap.ini for management port (e0/0)
-	iouyapData := "[default]\nbase_port = 49000\nnetmap = /iol/NETMAP\n"
-	netmapdata := ""
+	iouyapData = "[default]\nbase_port = 49000\nnetmap = /iol/NETMAP\n"
 	// A console node's Ethernet0/0 stays unplugged, like an unused port in GNS3: wired to the docker
 	// mgmt bridge it would join every node of the lab behind the student's topology.
 	if !n.consoleMode() {
@@ -336,22 +358,26 @@ func (n *iol) GenInterfaceConfig(_ context.Context) error {
 		netmapdata = fmt.Sprintf("%s:0/0 513:0/0\n", n.Pid)
 	}
 
-	slot, port := 0, 0
+	// NTG-333: IOL reads NETMAP only at boot, so a node booted with fixed slots maps every port now
+	// and a cable added later needs only iouyap.ini and an iouyap restart.
+	fixedPorts := parseSlots(n.Cfg.Env[envNumSlots]) * 4
+	for x := 1; x < fixedPorts; x++ {
+		netmapdata += fmt.Sprintf("%s:%d/%d 513:%d/%d\n", n.Pid, x/4, x%4, x/4, x%4)
+	}
 
-	// Regexp to pull number out of linux'ethX' interface naming
-	IntfRegExpr := regexp.MustCompile(`\d+`)
-
+	n.interfaces = nil
 	for _, intf := range n.interfaceEndpoints() {
-		// get numeric interface number and cast to int
-		x, _ := strconv.Atoi(IntfRegExpr.FindString(intf.GetIfaceName()))
+		x := ifIndex(intf.GetIfaceName())
 
 		// Interface naming is Ethernet{slot}/{port}. Each slot contains max 4 ports
-		slot = x / 4
-		port = x % 4
+		slot := x / 4
+		port := x % 4
 
 		// append data to write to NETMAP and IOUYAP files
 		iouyapData += fmt.Sprintf("[513:%d/%d]\neth_dev = %s\n", slot, port, intf.GetIfaceName())
-		netmapdata += fmt.Sprintf("%s:%d/%d 513:%d/%d\n", n.Pid, slot, port, slot, port)
+		if x >= fixedPorts {
+			netmapdata += fmt.Sprintf("%s:%d/%d 513:%d/%d\n", n.Pid, slot, port, slot, port)
+		}
 
 		// populate template array for config
 		ipv4Addr := ""
@@ -381,14 +407,110 @@ func (n *iol) GenInterfaceConfig(_ context.Context) error {
 		)
 	}
 
-	// create IOUYAP and NETMAP file for interface mappings
-	err := clabutils.CreateFile(path.Join(n.Cfg.LabDir, "iouyap.ini"), iouyapData)
-	if err != nil {
+	return iouyapData, netmapdata
+}
+
+// Regexp to pull number out of linux'ethX' interface naming
+var ifIndexRegexp = regexp.MustCompile(`\d+`)
+
+func ifIndex(ifName string) int {
+	x, _ := strconv.Atoi(ifIndexRegexp.FindString(ifName))
+	return x
+}
+
+// NTG-333: an image with this label boots IOL with that many Ethernet slots (env envNumSlots, read
+// by the image entrypoint), whatever is cabled at boot.
+const (
+	fixedSlotsLabel = "org.netgrader.iol.fixed-slots"
+	envNumSlots     = "CLAB_IOL_NUM_SLOTS"
+)
+
+// iouyapRestart is Elysia's NTG-194 restart: IOS keeps running with its unsaved config.
+const iouyapRestart = `for p in /proc/[0-9]*; do case "$(tr "\0" " " < $p/cmdline 2>/dev/null)" in "/usr/bin/iouyap 513 -q ") kill ${p#/proc/};; esac; done; sleep 1; cd /iol && (setsid /usr/bin/iouyap 513 -q >/proc/1/fd/1 2>&1 &); sleep 1`
+
+// parseSlots returns a slot count from 1 to 16, or 0.
+func parseSlots(v string) int {
+	s, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || s < 1 || s > 16 {
+		return 0
+	}
+	return s
+}
+
+// fixedSlots is the image's fixed slot count, or 0 for an image without the label.
+func (n *iol) fixedSlots(ctx context.Context) int {
+	if n.fixedSlotsOK {
+		return n.fixedSlotsN
+	}
+	n.fixedSlotsOK = true
+	if n.Cfg.Image == "" || n.Runtime == nil {
+		return 0
+	}
+	inspect, err := n.Runtime.InspectImage(ctx, n.Cfg.Image)
+	if err != nil || inspect == nil {
+		log.Debug("IOL image inspect failed; booting without fixed slots", "image", n.Cfg.Image, "error", err)
+		return 0
+	}
+	n.fixedSlotsN = parseSlots(inspect.Config.Labels[fixedSlotsLabel])
+	return n.fixedSlotsN
+}
+
+// runningSlots is the slot count the running container was started with, or 0 when it was not
+// started with one (an older image or fork, whose NETMAP lists only the cabled ports) or is not running.
+func (n *iol) runningSlots(ctx context.Context) int {
+	if n.runningSlotsOK {
+		return n.runningSlotsN
+	}
+	n.runningSlotsOK = true
+	if n.Runtime == nil {
+		return 0
+	}
+	res, err := n.Runtime.Exec(ctx, n.GetContainerName(),
+		clabexec.NewExecCmdFromSlice([]string{"printenv", envNumSlots}))
+	if err != nil || res.GetReturnCode() != 0 {
+		return 0
+	}
+	n.runningSlotsN = parseSlots(res.GetStdOutString())
+	return n.runningSlotsN
+}
+
+// LinkApplyMode is live only for a container booted with fixed slots that hold every cable;
+// anything else is recreated as before (NTG-333).
+func (n *iol) LinkApplyMode(ctx context.Context) clabnodes.LinkApplyMode {
+	if slots := n.runningSlots(ctx); slots > 0 {
+		fits := true
+		for _, ep := range n.Endpoints {
+			fits = fits && ifIndex(ep.GetIfaceName()) < slots*4
+		}
+		if fits {
+			return clabnodes.LinkApplyModeLive
+		}
+	}
+	return n.DefaultNode.LinkApplyMode(ctx)
+}
+
+// PostDeployEndpoints applies the cables apply added or removed on a running live-link node:
+// iouyap reads iouyap.ini only at start, so it is rewritten and iouyap restarted (NTG-333).
+// A container created in this run is skipped: its iouyap.ini is complete and its entrypoint starts
+// iouyap a few seconds after boot, so a restart now would leave two.
+func (n *iol) PostDeployEndpoints(ctx context.Context) error {
+	if n.created || n.runningSlots(ctx) == 0 {
+		return nil
+	}
+	iouyapData, _ := n.interfaceConfig()
+	if err := clabutils.CreateFile(path.Join(n.Cfg.LabDir, "iouyap.ini"), iouyapData); err != nil {
 		return err
 	}
-	err = clabutils.CreateFile(path.Join(n.Cfg.LabDir, "NETMAP"), netmapdata)
-
-	return err
+	res, err := n.Runtime.Exec(ctx, n.GetContainerName(),
+		clabexec.NewExecCmdFromSlice([]string{"sh", "-c", iouyapRestart}))
+	if err != nil {
+		return fmt.Errorf("iouyap restart: %w", err)
+	}
+	if res.GetReturnCode() != 0 {
+		return fmt.Errorf("iouyap restart (exit %d): %s", res.GetReturnCode(), strings.TrimSpace(res.GetStdErrString()))
+	}
+	log.Info("Restarted iouyap for link changes", "node", n.Cfg.ShortName)
+	return nil
 }
 
 // consoleCfgTemplate (NTG-260): a console node is reached over con0, so it gets no admin user,

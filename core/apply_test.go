@@ -155,6 +155,42 @@ func TestDeployLinksPostDeploysSelectedNodeWithoutLinks(t *testing.T) {
 	}
 }
 
+// NTG-333: a removal-only apply has no added links, yet both nodes of the removed veth lost an
+// interface their dataplane process used, so both get PostDeployEndpoints. A recreated node gets it
+// once, as before, through the deployed nodes; its kind knows it was just created.
+func TestRemovalOnlyApplyPostDeploysBothEndsOfTheRemovedLink(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	n1 := clabmocksmocknodes.NewMockNode(ctrl)
+	n2 := clabmocksmocknodes.NewMockNode(ctrl)
+	n3 := clabmocksmocknodes.NewMockNode(ctrl)
+	for _, n := range []*clabmocksmocknodes.MockNode{n1, n2, n3} {
+		n.EXPECT().PostDeployEndpoints(gomock.Any()).Return(nil) // exactly once each
+	}
+
+	plan := newApplyPlan(nil, nil)
+	plan.recreatedNodeSet["n3"] = struct{}{}
+	for _, key := range []applyEndpointKey{
+		{node: "n1", iface: "eth1"},
+		{node: "n2", iface: "eth1"},
+		{node: "n3", iface: "eth2"},
+		{node: "host", iface: "ve-n1_eth1"},
+	} {
+		plan.staleEndpoints = append(plan.staleEndpoints, applyEndpointRef{key: key})
+	}
+
+	if kept := plan.keptStaleEndpointNodeNames(); !slices.Equal(kept, []string{"n1", "n2", "host"}) {
+		t.Fatalf("kept stale endpoint nodes = %v", kept)
+	}
+
+	c := &CLab{Nodes: map[string]clabnodes.Node{"n1": n1, "n2": n2, "n3": n3}}
+	names := slices.Concat(plan.deployNodeNames(), plan.keptStaleEndpointNodeNames())
+	if err := c.deployLinks(context.Background(), nil, names); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestApplyRequiresTopologyFile(t *testing.T) {
 	t.Parallel()
 
