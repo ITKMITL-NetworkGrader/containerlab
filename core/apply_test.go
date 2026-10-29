@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -188,6 +189,34 @@ func TestRemovalOnlyApplyPostDeploysBothEndsOfTheRemovedLink(t *testing.T) {
 	names := slices.Concat(plan.deployNodeNames(), plan.keptStaleEndpointNodeNames())
 	if err := c.deployLinks(context.Background(), nil, names); err != nil {
 		t.Fatal(err)
+	}
+}
+
+type undeterminedNode struct {
+	*clabmocksmocknodes.MockNode
+	err error
+}
+
+func (n undeterminedNode) LinkApplyModeError() error { return n.err }
+
+// NTG-353: a recreate the node could not decide on is refused; one it decided on is not.
+func TestApplyPlanRefusesARecreateItCouldNotDecide(t *testing.T) {
+	t.Parallel()
+
+	ctrl := gomock.NewController(t)
+	nodes := map[string]clabnodes.Node{
+		"decided":   undeterminedNode{clabmocksmocknodes.NewMockNode(ctrl), nil},
+		"undecided": undeterminedNode{clabmocksmocknodes.NewMockNode(ctrl), errors.New("exec timeout")},
+		"kept":      undeterminedNode{clabmocksmocknodes.NewMockNode(ctrl), errors.New("exec timeout")},
+	}
+	plan := newApplyPlan(nil, nil)
+	plan.recreatedNodeSet["decided"] = struct{}{}
+	if err := plan.undeterminedRecreate(nodes); err != nil {
+		t.Fatalf("decided recreate refused: %v", err)
+	}
+	plan.recreatedNodeSet["undecided"] = struct{}{}
+	if err := plan.undeterminedRecreate(nodes); err == nil || !strings.Contains(err.Error(), `"undecided"`) {
+		t.Fatalf("undecided recreate: %v", err)
 	}
 }
 

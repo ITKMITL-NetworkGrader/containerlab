@@ -171,7 +171,26 @@ func (c *CLab) planApply(
 		delete(plan.linkRestartNodeSet, nodeName)
 	}
 
+	if err := plan.undeterminedRecreate(c.Nodes); err != nil {
+		return nil, err
+	}
+
 	return plan, nil
+}
+
+// undeterminedRecreate refuses a plan that recreates a node which could not tell whether it takes
+// its cable changes live (NTG-353). Guessing recreate lets a dry run and the apply after it
+// disagree, so the apply would recreate a node its caller never saw in the dry run.
+func (p *applyPlan) undeterminedRecreate(nodes map[string]clabnodes.Node) error {
+	for _, nodeName := range sortedNodeNames(nodes) {
+		if _, recreated := p.recreatedNodeSet[nodeName]; !recreated {
+			continue
+		}
+		if n, ok := nodes[nodeName].(interface{ LinkApplyModeError() error }); ok && n.LinkApplyModeError() != nil {
+			return fmt.Errorf("node %q link apply mode: %w", nodeName, n.LinkApplyModeError())
+		}
+	}
+	return nil
 }
 
 func (p *applyPlan) addDeployApplyLink(linkIdx int, link clablinks.Link) {

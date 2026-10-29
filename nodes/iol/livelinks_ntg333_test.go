@@ -179,3 +179,30 @@ func TestPostDeployEndpointsSkipsAContainerCreatedInThisRun(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// NTG-353: a running container whose env could not be read may be live-capable, so the mode is
+// undetermined, not "recreate"; a container that is not running is simply recreated.
+func TestLinkApplyModeIsUndeterminedWhenARunningContainerCannotBeAsked(t *testing.T) {
+	ctx := context.Background()
+
+	n, rt := liveIOL(t, map[string]string{}, "eth1")
+	rt.EXPECT().Exec(gomock.Any(), "clab-lab-router1", gomock.Any()).Return(nil, os.ErrDeadlineExceeded)
+	rt.EXPECT().GetContainerStatus(gomock.Any(), "clab-lab-router1").Return(clabruntime.Running)
+	n.LinkApplyMode(ctx)
+	if err := n.LinkApplyModeError(); err == nil {
+		t.Fatal("exec failed on a running container: no error")
+	}
+
+	n, rt = liveIOL(t, map[string]string{}, "eth1")
+	rt.EXPECT().Exec(gomock.Any(), "clab-lab-router1", gomock.Any()).Return(nil, os.ErrDeadlineExceeded)
+	rt.EXPECT().GetContainerStatus(gomock.Any(), "clab-lab-router1").Return(clabruntime.Stopped)
+	if got := n.LinkApplyMode(ctx); got != clabnodes.LinkApplyModeRecreate || n.LinkApplyModeError() != nil {
+		t.Fatalf("stopped container: mode %q, error %v; want recreate, nil", got, n.LinkApplyModeError())
+	}
+
+	n, rt = liveIOL(t, map[string]string{}, "eth1")
+	execReturns(rt, "printenv "+envNumSlots, "", 1)
+	if n.LinkApplyMode(ctx); n.LinkApplyModeError() != nil {
+		t.Fatalf("unset env: error %v, want nil", n.LinkApplyModeError())
+	}
+}

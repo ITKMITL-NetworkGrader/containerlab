@@ -31,6 +31,7 @@ import (
 	clabexec "github.com/srl-labs/containerlab/exec"
 	clablinks "github.com/srl-labs/containerlab/links"
 	clabnodes "github.com/srl-labs/containerlab/nodes"
+	clabruntime "github.com/srl-labs/containerlab/runtime"
 	clabtypes "github.com/srl-labs/containerlab/types"
 	clabutils "github.com/srl-labs/containerlab/utils"
 )
@@ -107,6 +108,7 @@ type iol struct {
 	created                      bool
 	fixedSlotsN, runningSlotsN   int
 	fixedSlotsOK, runningSlotsOK bool
+	runningSlotsErr              error
 }
 
 func (n *iol) Init(cfg *clabtypes.NodeConfig, opts ...clabnodes.NodeOption) error {
@@ -467,11 +469,25 @@ func (n *iol) runningSlots(ctx context.Context) int {
 	}
 	res, err := n.Runtime.Exec(ctx, n.GetContainerName(),
 		clabexec.NewExecCmdFromSlice([]string{"printenv", envNumSlots}))
-	if err != nil || res.GetReturnCode() != 0 {
-		return 0
+	switch {
+	case err == nil && res.GetReturnCode() == 0:
+		n.runningSlotsN = parseSlots(res.GetStdOutString())
+	case err == nil && res.GetReturnCode() == 1:
+		// printenv: the variable is unset, so an older image or fork started the container.
+	case n.GetContainerStatus(ctx) == clabruntime.Running:
+		// NTG-353: a running container that could not be asked may take its cables live; recreating
+		// it would lose its unsaved config, so apply stops instead of guessing.
+		if err == nil {
+			err = fmt.Errorf("exit %d: %s", res.GetReturnCode(), strings.TrimSpace(res.GetStdErrString()))
+		}
+		n.runningSlotsErr = fmt.Errorf("could not read %s: %w", envNumSlots, err)
 	}
-	n.runningSlotsN = parseSlots(res.GetStdOutString())
 	return n.runningSlotsN
+}
+
+// LinkApplyModeError is why LinkApplyMode could not tell whether the node takes cable changes live.
+func (n *iol) LinkApplyModeError() error {
+	return n.runningSlotsErr
 }
 
 // LinkApplyMode is live only for a container booted with fixed slots that hold every cable;
