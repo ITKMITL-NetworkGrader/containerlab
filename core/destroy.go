@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
@@ -19,6 +20,7 @@ import (
 	clabruntime "github.com/srl-labs/containerlab/runtime"
 	clabtypes "github.com/srl-labs/containerlab/types"
 	clabutils "github.com/srl-labs/containerlab/utils"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/term"
 )
 
@@ -65,8 +67,11 @@ func (c *CLab) Destroy(ctx context.Context, options ...DestroyOption) (err error
 		topos[topoFile] = filepath.Dir(containers[idx].Labels[clabconstants.NodeLabDir])
 	}
 
+	// copyFailed: nothing was destroyed, so keep the lab dirs and return the error (NTG-439: the
+	// cleanup used to overwrite it, and the caller saw a "successful" destroy with every node up).
+	copyFailed := false
 	defer func() {
-		if opts.cleanup {
+		if opts.cleanup && !copyFailed {
 			err = c.destroyLabDirs(topos, opts.all)
 		}
 	}()
@@ -95,9 +100,10 @@ func (c *CLab) Destroy(ctx context.Context, options ...DestroyOption) (err error
 	var errs []error
 
 	for topo, labDir := range topos {
-		cc, err := c.makeCopyForDestroy(ctx, topo, labDir, *opts)
+		cc, err := c.makeCopyForDestroyRetrying(ctx, topo, labDir, *opts)
 		if err != nil {
 			log.Errorf("error creating clab instance for topo %q: %v", topo, err)
+			copyFailed = true
 
 			return err
 		}
@@ -114,6 +120,38 @@ func (c *CLab) Destroy(ctx context.Context, options ...DestroyOption) (err error
 	}
 
 	return err
+}
+
+// destroyCopyAttempts: another lab's destroy removing its veths interrupts this one's netlink link
+// dump (NLM_F_DUMP_INTR, "results may be incomplete or inconsistent"); the kernel expects the caller
+// to retry. Parallel destroys hit it on 15-23 of 55 labs (NTG-439).
+const destroyCopyAttempts = 6
+
+func isDumpInterrupted(err error) bool {
+	return err != nil && (errors.Is(err, netlink.ErrDumpInterrupted) ||
+		strings.Contains(err.Error(), netlink.ErrDumpInterrupted.Error()))
+}
+
+func (c *CLab) makeCopyForDestroyRetrying(
+	ctx context.Context,
+	topo, labDir string,
+	opts DestroyOptions,
+) (*CLab, error) {
+	for attempt := 1; ; attempt++ {
+		cc, err := c.makeCopyForDestroy(ctx, topo, labDir, opts)
+		if !isDumpInterrupted(err) || attempt >= destroyCopyAttempts {
+			return cc, err
+		}
+
+		log.Warnf("netlink dump interrupted while preparing %q for destroy, retrying (%d/%d)",
+			topo, attempt, destroyCopyAttempts)
+
+		select {
+		case <-ctx.Done():
+			return cc, err
+		case <-time.After(time.Duration(attempt) * 300 * time.Millisecond):
+		}
+	}
 }
 
 // creates a mostly cloned version of the current c but set to the new topology, and with the
